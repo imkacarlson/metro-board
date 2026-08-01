@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+
+# Secrets — never commit these. Templates are committed instead.
+secrets.py
+settings.toml
+
+# CircuitPython output
+boot_out.txt
+
+# On-board OTA state (generated, board-local)
+version.txt
+ota_blocked.txt
+backup/
+*.tmp
+
+# Library directory (CircuitPython libraries, installed by hand)
+lib/
+
+# Adafruit CircuitPython bundle
+adafruit-circuitpython-bundle-*/
+adafruit-circuitpython-bundle-*.zip

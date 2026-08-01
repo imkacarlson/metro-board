@@ -1,0 +1,68 @@
+name: Publish OTA deploy branch
+
+# Push to main only. Never pull_request_target: that trigger hands fork PRs a
+# write-scoped token plus secrets, and is the classic way a public repo gets
+# taken over. Fork PRs get a read-only token and cannot publish anything.
+on:
+  push:
+    branches: [main]
+
+# Nothing else. The workflow needs no secrets at all.
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # No third-party actions anywhere in this workflow, not even
+      # actions/checkout. A `uses:` author -- or anyone who moves that tag --
+      # could inject code straight into what the board downloads and runs.
+      - name: Build and publish deploy branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+
+          git clone --depth 1 --branch main "$REMOTE" src
+          mkdir out
+
+          cd src
+          python3 - <<'PY'
+          import json, os
+
+          # Exactly the files ota.py is allowed to write. Keep in sync with
+          # ota.ALLOWED_FILES.
+          FILES = ['code.py', 'config.py', 'metro_api.py', 'train_board.py']
+
+          manifest = {
+              'version': os.environ['SHA'][:7],
+              'files': [{'path': f, 'size': os.stat(f).st_size} for f in FILES],
+          }
+
+          # Compact separators so the board can pull the version out with a
+          # plain string search instead of parsing JSON.
+          with open('../out/manifest.json', 'w') as fh:
+              json.dump(manifest, fh, separators=(',', ':'))
+
+          for f in FILES:
+              with open(f, 'rb') as src, open('../out/' + f, 'wb') as dst:
+                  dst.write(src.read())
+
+          print(json.dumps(manifest, indent=2))
+          PY
+
+          cd ../out
+          git init -q -b deploy
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "deploy ${SHA:0:7}"
+
+          # deploy is a generated artifact branch with no history worth keeping.
+          git push -q -f "$REMOTE" deploy
+          echo "Published ${SHA:0:7} to the deploy branch."

@@ -1,0 +1,23 @@
+# Copy to settings.toml on the CIRCUITPY drive and fill in.
+# settings.toml is gitignored and is never part of an OTA manifest, so nothing
+# here is ever published.
+
+CIRCUITPY_WIFI_SSID = "your_wifi_network_name"
+CIRCUITPY_WIFI_PASSWORD = "your_wifi_password"
+
+# WMATA developer API key — https://developer.wmata.com/
+# config.py reads this via os.getenv(). It must NOT be hardcoded in config.py:
+# config.py is fetched over the air from a public URL, so anything in it is
+# public by construction.
+WMATA_API_KEY = "your_wmata_api_key"
+
+# Adafruit IO credentials (free account at io.adafruit.com)
+ADAFRUIT_AIO_USERNAME = "your_username"
+ADAFRUIT_AIO_KEY = "aio_your_key_here"
+
+# Optional timezone (defaults to IP geolocation)
+# timezone = "America/New_York"
+
+# Fix PyStack exhaustion in networking calls
+CIRCUITPY_PYSTACK_SIZE = 8192
+CIRCUITPY_HEAP_START_SIZE = 32768
