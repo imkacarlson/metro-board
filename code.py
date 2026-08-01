@@ -1,11 +1,22 @@
 # DC Metro Board
+import gc
 import time
 import supervisor
 
+import bootlog
 import rollback
+
+# Imports are staged and logged so a failure on the shelf says which module died
+# and how much RAM was left when it happened. This board is tight enough that
+# the fetch path already collects four times before each request and reloads
+# below 10 KB free, so an import-time MemoryError is a live possibility.
+bootlog.append('code: importing, free=%d' % gc.mem_free())
 from config import config
+bootlog.append('code: config ok, free=%d' % gc.mem_free())
 from train_board import TrainBoard
+bootlog.append('code: train_board ok, free=%d' % gc.mem_free())
 from metro_api import MetroApi, MetroApiOnFireException
+bootlog.append('code: metro_api ok, free=%d' % gc.mem_free())
 
 STATION_CODE = config['metro_station_code']
 TRAIN_GROUP = config['train_group']
@@ -107,6 +118,16 @@ def _mark_healthy():
 		rollback.set_failed_boots(0)
 	except Exception as e:
 		print(f'Could not reset boot-health counter: {e}')
+
+	# Bootstrap the safety net. Until some build has proved itself there is
+	# nothing to roll back to, so the first healthy run snapshots itself.
+	if not rollback.have_backup():
+		try:
+			rollback.snapshot()
+			bootlog.append('code: snapshotted this build to %s' % rollback.BACKUP_DIR)
+		except Exception as e:
+			bootlog.append('code: could not snapshot: %s' % e)
+
 	_marked_healthy = True
 	print('Boot marked healthy.')
 
@@ -151,7 +172,10 @@ def refresh_trains() -> [dict]:
 		return None
 
 up_button = _update_button()
+bootlog.append('code: button ok, free=%d' % gc.mem_free())
+
 train_board = TrainBoard(refresh_trains)
+bootlog.append('code: display up, free=%d' % gc.mem_free())
 
 last_refresh = 0
 last_blink_update = 0
@@ -171,6 +195,7 @@ while True:
 				# Order matters: prove this build works and clear the rollback
 				# counter *before* an update can send us round again, otherwise
 				# a run of successful updates would look like a run of failures.
+				bootlog.append('code: first refresh ok, free=%d' % gc.mem_free())
 				_mark_healthy()
 				check_for_update()
 
@@ -190,7 +215,10 @@ while True:
 
 		time.sleep(0.01)  # Smaller sleep for more responsive timing
 	except Exception as e:
-		print(f"Caught exception: {e}")
+		# Runtime failures are caught here and never reach recover.py, so this
+		# is the only record of them.
+		bootlog.append('code: exception in main loop, free=%d: %s'
+			% (gc.mem_free(), e))
 		print("Rebooting...\n")
 		time.sleep(5)
 		supervisor.reload()

@@ -15,10 +15,13 @@ through here. Two things follow, and the whole update design rests on them:
 import storage
 import supervisor
 
+import bootlog
 import rollback
 
+usb = supervisor.runtime.usb_connected
+
 writable = False
-if supervisor.runtime.usb_connected:
+if usb:
     print('boot: USB connected — filesystem read-only, drag-and-drop enabled')
 else:
     try:
@@ -28,6 +31,12 @@ else:
     except RuntimeError as e:
         # Benign: the board simply never updates and keeps running what it has.
         print('boot: remount failed, OTA disabled:', e)
+
+# First line of each boot, and the first chance to write anything down. Also
+# settles the one thing that could never be tested while tethered: what
+# usb_connected actually reports on a dumb power brick.
+bootlog.append('--- boot: usb_connected=%s writable=%s failed_boots=%d'
+               % (usb, writable, rollback.failed_boots()))
 
 if writable:
     # If code.py exits with an exception, reload into recover.py instead of

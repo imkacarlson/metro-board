@@ -65,6 +65,23 @@ def set_failed_boots(n):
     microcontroller.nvm[NVM_HEALTH_SLOT:NVM_HEALTH_SLOT + 1] = bytes([n])
 
 
+def snapshot():
+    """Record the current files as the known-good build to fall back to.
+
+    Called only from a run that has actually displayed trains, so what gets
+    captured is by definition a build that works. Without this the very first
+    standalone boot has no safety net: recover.py would find no /backup and
+    halt, which is a dead board rather than a rolled-back one.
+    """
+    if not exists(BACKUP_DIR):
+        os.mkdir(BACKUP_DIR)
+    for name in OTA_FILES:
+        if exists('/' + name):
+            copy('/' + name, BACKUP_DIR + '/' + name)
+    if exists(VERSION_FILE):
+        copy(VERSION_FILE, BACKUP_DIR + VERSION_FILE)
+
+
 def restore():
     """Put /backup back over the live files. Returns the number restored.
 
