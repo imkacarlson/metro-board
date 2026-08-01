@@ -1,8 +1,8 @@
 # DC Metro Board
 import time
 import supervisor
-import microcontroller
 
+import rollback
 from config import config
 from train_board import TrainBoard
 from metro_api import MetroApi, MetroApiOnFireException
@@ -20,21 +20,10 @@ NO_SERVICE_END_HOUR = config['no_service_end_hour']
 # Same pinned owner/repo/branch as ota.py. This file only ever *reads* the
 # version; ota.py is the only thing that writes to the filesystem.
 MANIFEST_URL = 'https://raw.githubusercontent.com/imkacarlson/metro-board/deploy/manifest.json'
-VERSION_FILE = '/version.txt'
-BLOCKED_FILE = '/ota_blocked.txt'
 UPDATE_CHECK_INTERVAL = 24 * 60 * 60  # seconds
-NVM_HEALTH_SLOT = 0
 
 _last_update_check = 0
 _marked_healthy = False
-
-
-def _read_line(path):
-	try:
-		with open(path, 'r') as f:
-			return f.read(64).strip()
-	except OSError:
-		return ''
 
 
 def _remote_version():
@@ -80,14 +69,14 @@ def check_for_update():
 		print('OTA: no version in manifest')
 		return
 
-	blocked = _read_line(BLOCKED_FILE)
+	blocked = rollback.read_line(rollback.BLOCKED_FILE)
 	if remote == blocked:
-		# boot.py rolled this version back after it failed to boot. Sit tight
-		# until a different version is published rather than loop on it.
+		# This version was rolled back after it failed to boot. Sit tight until
+		# a different one is published rather than loop on it.
 		print(f'OTA: {remote} is quarantined after a failed boot — skipping')
 		return
 
-	local = _read_line(VERSION_FILE)
+	local = rollback.read_line(rollback.VERSION_FILE)
 	if remote == local:
 		print(f'OTA: up to date ({local})')
 		return
@@ -98,12 +87,16 @@ def check_for_update():
 
 
 def _mark_healthy():
-	"""Tell boot.py this build works, so it stops counting toward a rollback."""
+	"""Zero the boot-health counter. This is the ONLY thing that clears it.
+
+	boot.py increments it and recover.py reads it; if nothing ever zeroed it,
+	a board that cannot display trains would roll back forever.
+	"""
 	global _marked_healthy
 	if _marked_healthy:
 		return
 	try:
-		microcontroller.nvm[NVM_HEALTH_SLOT:NVM_HEALTH_SLOT + 1] = b'\x00'
+		rollback.set_failed_boots(0)
 	except Exception as e:
 		print(f'Could not reset boot-health counter: {e}')
 	_marked_healthy = True

@@ -29,7 +29,12 @@ answer to remote code editing.
 2. Install the CircuitPython libraries into `lib/`: `adafruit_matrixportal`,
    `adafruit_display_text`, `adafruit_display_shapes`, `adafruit_bitmap_font`,
    plus the `5x7.bdf` font.
-3. Copy `boot.py`, `ota.py` and the four application files onto the board.
+3. Copy `boot.py`, `recover.py`, `rollback.py`, `ota.py` and the four
+   application files onto the board, plus a `version.txt` containing the short
+   SHA currently published on the `deploy` branch.
+
+`code.py` imports `rollback`, so `rollback.py` must be present on the board even
+though it is never updated over the air.
 
 [wmata]: https://developer.wmata.com/
 
@@ -67,22 +72,48 @@ board on the version it was already running.
 | File | Updatable | Why |
 |---|---|---|
 | `code.py`, `config.py`, `metro_api.py`, `train_board.py` | yes | the application |
-| `boot.py` | **no** | it *is* the recovery path; nothing remote may disable it |
+| `boot.py`, `recover.py`, `rollback.py` | **no** | they *are* the recovery path; nothing remote may disable it |
 | `ota.py` | **no** | an updater that can overwrite itself has no floor to stand on |
 | `secrets.py`, `settings.toml` | **no** | credentials, never published |
 
-Changing `boot.py` or `ota.py` means plugging the board in. That is the point.
+Changing any of those means plugging the board in. That is the point.
 
 ### Rollback
 
-`boot.py` bumps a counter in non-volatile memory on every boot; `code.py` zeroes
-it once the display has actually refreshed. Three consecutive boots that never
-reach a healthy state and `boot.py` restores `/backup` over the live files.
+The important constraint is one most CircuitPython write-ups gloss over:
+**`boot.py` runs only once per hard reset.** `main.c` calls `run_boot_py()`
+outside the run loop, so `supervisor.reload()` never comes back through it. Two
+things follow, and the design leans on both.
 
-It also writes the version that broke to `/ota_blocked.txt`, and `code.py`
-refuses to install that version again. Without this the board would roll back,
-immediately re-download the same broken build, and loop. It sits on the last
-good version until a *different* one is published.
+First, the writable remount `boot.py` performs survives the soft reload into
+`ota.py` — which is the only reason `ota.py` can write files at all.
+
+Second, a boot counter on its own is not enough. If a freshly downloaded
+`code.py` fails at *import*, nothing in `boot.py` ever runs again, and the board
+would sit dead until somebody power-cycled it three times. So `boot.py` arms
+CircuitPython's own mechanism instead:
+
+```python
+supervisor.set_next_code_file('recover.py', reload_on_error=True, sticky_on_error=True)
+```
+
+When `code.py` exits with an exception, the board reloads into `recover.py`,
+which restores `/backup` over the live files, records the version that broke in
+`/ota_blocked.txt`, and hard-resets. `code.py` then refuses to install that
+version again — without the quarantine the board would roll back, immediately
+re-download the same broken build, and loop. It sits on the last good version
+until a *different* one is published.
+
+The hook is armed only when the filesystem is writable, i.e. only when running
+standalone. A syntax error while tethered leaves the traceback on screen for you
+to read instead of resetting it away.
+
+The boot counter remains as a backstop for failures that never raise — a hang,
+or a crash that resets the board outright. It has exactly one rule: **only a
+healthy run zeroes it.** `boot.py` increments it, `recover.py` reads it to
+decide whether to keep trying, and `code.py` zeroes it once the display has
+actually refreshed. That invariant is what makes a permanently broken build halt
+after a few attempts rather than thrash the flash forever.
 
 Recovery ladder if all of that somehow fails: single reset reboots; double-press
 reset enters safe mode, which skips both `boot.py` and `code.py` and restores
@@ -175,7 +206,9 @@ on this end.
 | `config.py` | Configuration and display tokens |
 | `metro_api.py` | WMATA fetch, streaming parser, transfer logic |
 | `train_board.py` | Matrix display |
-| `boot.py` | Mount decision and rollback (never OTA-updated) |
+| `boot.py` | Mount decision, arms the recovery hook (never OTA-updated) |
+| `recover.py` | Runs when `code.py` throws; rolls back (never OTA-updated) |
+| `rollback.py` | Shared restore/quarantine helpers (never OTA-updated) |
 | `ota.py` | The updater itself (never OTA-updated) |
 | `.github/workflows/deploy.yml` | Publishes the `deploy` branch |
 

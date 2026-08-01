@@ -14,6 +14,7 @@ import gc
 import os
 import json
 import supervisor
+import microcontroller
 
 # Pinned. Owner, repo and branch are fixed here and the manifest is never
 # allowed to contribute any part of a URL — see _install().
@@ -250,7 +251,9 @@ try:
 except Exception as e:
     print('ota: update abandoned, staying on current version:', e)
 
-# Whatever happened, the board goes back to being a train board. boot.py runs
-# again on reload and re-decides the mount state from scratch.
-supervisor.set_next_code_file('code.py')
-supervisor.reload()
+# Hard reset rather than supervisor.reload(). boot.py only runs on a hard reset
+# (main.c calls run_boot_py() outside the run loop), and it is boot.py that arms
+# recover.py — so a soft reload here would hand control to a freshly installed
+# code.py with no recovery hook, which is precisely when one is needed.
+print('ota: resetting into code.py')
+microcontroller.reset()
