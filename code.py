@@ -1,10 +1,29 @@
 # DC Metro Board
 import gc
 import time
+import storage
 import supervisor
 
 import bootlog
 import rollback
+
+# The mount decision belongs here, not in boot.py. By now the USB stack is
+# running, so usb_connected is finally truthful — and storage.remount() itself
+# refuses when the drive is visible to a host, which makes this correct even if
+# usb_connected were somehow wrong. Tethered: stay read-only to Python so
+# drag-and-drop keeps working. Standalone: become writable so logging and OTA
+# can happen.
+WRITABLE = False
+if supervisor.runtime.usb_connected:
+	print('mount: USB connected — read-only to Python, drag-and-drop enabled')
+else:
+	try:
+		storage.remount('/', readonly=False)
+		WRITABLE = True
+		print('mount: standalone — filesystem writable, OTA enabled')
+	except RuntimeError as e:
+		# Benign: no logging and no updates, but the board still shows trains.
+		print('mount: remount refused, OTA disabled:', e)
 
 # Imports are staged and logged so a failure on the shelf says which module died
 # and how much RAM was left when it happened. This board is tight enough that
