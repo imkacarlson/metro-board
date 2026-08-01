@@ -41,6 +41,8 @@ else:
 # and how much RAM was left when it happened. This board is tight enough that
 # the fetch path already collects four times before each request and reloads
 # below 10 KB free, so an import-time MemoryError is a live possibility.
+bootlog.append('code: mount usb_connected=%s writable=%s'
+	% (supervisor.runtime.usb_connected, WRITABLE))
 bootlog.append('code: importing, free=%d' % gc.mem_free())
 from config import config
 bootlog.append('code: config ok, free=%d' % gc.mem_free())
@@ -207,7 +209,24 @@ def refresh_trains() -> [dict]:
 # which kills the whole board for the sake of a convenience feature. This order
 # means a pin conflict costs only the UP-button shortcut: _update_button()
 # swallows the error and returns None, and the daily check still runs.
-train_board = TrainBoard(refresh_trains)
+# Instrumented deliberately. On the shelf this is where the board stops, and the
+# log alone cannot say whether TrainBoard() raised or simply never returned.
+# The line before it plus the except block tell those two apart: if only
+# 'constructing display' appears, it hung; if a FAILED line appears, it threw.
+bootlog.append('code: constructing display...')
+try:
+	train_board = TrainBoard(refresh_trains)
+except Exception as e:
+	bootlog.append('code: TrainBoard FAILED %s: %s' % (type(e).__name__, e))
+	try:
+		import io
+		import traceback
+		_s = io.StringIO()
+		traceback.print_exception(type(e), e, getattr(e, '__traceback__', None), file=_s)
+		bootlog.append(_s.getvalue())
+	except Exception as e2:
+		bootlog.append('code: (no traceback: %s)' % e2)
+	raise
 bootlog.append('code: display up, free=%d' % gc.mem_free())
 
 up_button = _update_button()
