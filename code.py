@@ -13,6 +13,18 @@ import rollback
 # usb_connected were somehow wrong. Tethered: stay read-only to Python so
 # drag-and-drop keeps working. Standalone: become writable so logging and OTA
 # can happen.
+#
+# The wait matters. code.py starts immediately after boot.py, and while the USB
+# stack is running by now, the host has not necessarily finished enumerating
+# yet — so reading usb_connected once still races and loses. Unlike in boot.py,
+# polling here genuinely resolves: a host completes enumeration in well under a
+# second, a dumb power brick never does and just costs this timeout once.
+USB_ENUMERATION_TIMEOUT = 3.0
+
+_deadline = time.monotonic() + USB_ENUMERATION_TIMEOUT
+while not supervisor.runtime.usb_connected and time.monotonic() < _deadline:
+	time.sleep(0.05)
+
 WRITABLE = False
 if supervisor.runtime.usb_connected:
 	print('mount: USB connected — read-only to Python, drag-and-drop enabled')
