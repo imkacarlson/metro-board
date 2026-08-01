@@ -202,11 +202,16 @@ def refresh_trains() -> [dict]:
 		print('WMATA Api is currently on fire. Trying again later ...')
 		return None
 
-up_button = _update_button()
-bootlog.append('code: button ok, free=%d' % gc.mem_free())
-
+# Display first, button second. Claiming board.BUTTON_UP before the matrix is
+# built can leave a pin already in use when the HUB75 driver goes to claim it,
+# which kills the whole board for the sake of a convenience feature. This order
+# means a pin conflict costs only the UP-button shortcut: _update_button()
+# swallows the error and returns None, and the daily check still runs.
 train_board = TrainBoard(refresh_trains)
 bootlog.append('code: display up, free=%d' % gc.mem_free())
+
+up_button = _update_button()
+bootlog.append('code: button=%s, free=%d' % (up_button is not None, gc.mem_free()))
 
 last_refresh = 0
 last_blink_update = 0
