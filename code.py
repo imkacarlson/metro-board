@@ -59,6 +59,14 @@ def check_for_update():
 	global _last_update_check
 	_last_update_check = time.monotonic()
 
+	if supervisor.runtime.usb_connected:
+		# Tethered: boot.py left the filesystem read-only, so ota.py could not
+		# install anything even if we handed off to it. Without this check a
+		# published update would loop — hand off, decline to write, reset, find
+		# the same mismatch, hand off again.
+		print('OTA: USB connected — skipping update check (drag-and-drop mode)')
+		return
+
 	try:
 		remote = _remote_version()
 	except Exception as e:
