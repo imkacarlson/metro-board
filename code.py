@@ -7,49 +7,20 @@ import supervisor
 import bootlog
 import rollback
 
-# The mount decision belongs here, not in boot.py. By now the USB stack is
-# running, so usb_connected is finally truthful — and storage.remount() itself
-# refuses when the drive is visible to a host, which makes this correct even if
-# usb_connected were somehow wrong. Tethered: stay read-only to Python so
-# drag-and-drop keeps working. Standalone: become writable so logging and OTA
-# can happen.
-#
-# The wait matters. code.py starts immediately after boot.py, and while the USB
-# stack is running by now, the host has not necessarily finished enumerating
-# yet — so reading usb_connected once still races and loses. Unlike in boot.py,
-# polling here genuinely resolves: a host completes enumeration in well under a
-# second, a dumb power brick never does and just costs this timeout once.
-USB_ENUMERATION_TIMEOUT = 3.0
-
-_deadline = time.monotonic() + USB_ENUMERATION_TIMEOUT
-while not supervisor.runtime.usb_connected and time.monotonic() < _deadline:
-	time.sleep(0.05)
-
-WRITABLE = False
-if supervisor.runtime.usb_connected:
-	print('mount: USB connected — read-only to Python, drag-and-drop enabled')
-else:
-	try:
-		storage.remount('/', readonly=False)
-		WRITABLE = True
-		print('mount: standalone — filesystem writable, OTA enabled')
-	except RuntimeError as e:
-		# Benign: no logging and no updates, but the board still shows trains.
-		print('mount: remount refused, OTA disabled:', e)
-
-# Imports are staged and logged so a failure on the shelf says which module died
-# and how much RAM was left when it happened. This board is tight enough that
-# the fetch path already collects four times before each request and reloads
-# below 10 KB free, so an import-time MemoryError is a live possibility.
-bootlog.append('code: mount usb_connected=%s writable=%s'
-	% (supervisor.runtime.usb_connected, WRITABLE))
-bootlog.append('code: importing, free=%d' % gc.mem_free())
+# NOTHING may touch the filesystem before the matrix is built. The RGBMatrix
+# framebuffer is a large allocation from outside the Python heap, and flash
+# writes draw buffers from that same pool — six log lines were enough to make
+# Matrix() fail with "Failed to allocate RGBMatrix buffer" while 92 KB of Python
+# heap sat unused. That is why the mount decision, and every log write, now
+# happens *after* the display exists rather than before it. Use bootlog.defer()
+# until then; it holds lines in RAM and prints to serial.
+bootlog.defer('code: importing, free=%d' % gc.mem_free())
 from config import config
-bootlog.append('code: config ok, free=%d' % gc.mem_free())
+bootlog.defer('code: config ok, free=%d' % gc.mem_free())
 from train_board import TrainBoard
-bootlog.append('code: train_board ok, free=%d' % gc.mem_free())
+bootlog.defer('code: train_board ok, free=%d' % gc.mem_free())
 from metro_api import MetroApi, MetroApiOnFireException
-bootlog.append('code: metro_api ok, free=%d' % gc.mem_free())
+bootlog.defer('code: metro_api ok, free=%d' % gc.mem_free())
 
 STATION_CODE = config['metro_station_code']
 TRAIN_GROUP = config['train_group']
@@ -204,31 +175,57 @@ def refresh_trains() -> [dict]:
 		print('WMATA Api is currently on fire. Trying again later ...')
 		return None
 
-# Display first, button second. Claiming board.BUTTON_UP before the matrix is
-# built can leave a pin already in use when the HUB75 driver goes to claim it,
-# which kills the whole board for the sake of a convenience feature. This order
-# means a pin conflict costs only the UP-button shortcut: _update_button()
-# swallows the error and returns None, and the daily check still runs.
-# Instrumented deliberately. On the shelf this is where the board stops, and the
-# log alone cannot say whether TrainBoard() raised or simply never returned.
-# The line before it plus the except block tell those two apart: if only
-# 'constructing display' appears, it hung; if a FAILED line appears, it threw.
-bootlog.append('code: constructing display...')
+# The matrix goes up first, before the mount decision and before anything is
+# written to flash. This is the single most order-sensitive line in the file.
+bootlog.defer('code: constructing display...')
 try:
 	train_board = TrainBoard(refresh_trains)
 except Exception as e:
-	bootlog.append('code: TrainBoard FAILED %s: %s' % (type(e).__name__, e))
-	try:
-		import io
-		import traceback
-		_s = io.StringIO()
-		traceback.print_exception(type(e), e, getattr(e, '__traceback__', None), file=_s)
-		bootlog.append(_s.getvalue())
-	except Exception as e2:
-		bootlog.append('code: (no traceback: %s)' % e2)
-	raise
-bootlog.append('code: display up, free=%d' % gc.mem_free())
+	bootlog.defer('code: TrainBoard FAILED %s: %s' % (type(e).__name__, e))
+	_pending_failure = e
+else:
+	_pending_failure = None
+	bootlog.defer('code: display up, free=%d' % gc.mem_free())
 
+# Now the buffer is claimed, so the filesystem is safe to touch.
+#
+# usb_connected is finally truthful here — the USB stack is running, unlike in
+# boot.py where it has not started. It still needs a moment: code.py begins
+# immediately after boot.py and the host may not have finished enumerating, so
+# reading it once races and loses. A host resolves in well under a second; a
+# dumb power brick never enumerates and just costs this timeout once.
+#
+# storage.remount() also refuses outright when the drive is host-visible, so the
+# decision stays correct even if usb_connected were somehow wrong.
+USB_ENUMERATION_TIMEOUT = 3.0
+
+_deadline = time.monotonic() + USB_ENUMERATION_TIMEOUT
+while not supervisor.runtime.usb_connected and time.monotonic() < _deadline:
+	time.sleep(0.05)
+
+WRITABLE = False
+if supervisor.runtime.usb_connected:
+	print('mount: USB connected — read-only to Python, drag-and-drop enabled')
+else:
+	try:
+		storage.remount('/', readonly=False)
+		WRITABLE = True
+		print('mount: standalone — filesystem writable, OTA enabled')
+	except RuntimeError as e:
+		# Benign: no logging and no updates, but the board still shows trains.
+		print('mount: remount refused, OTA disabled:', e)
+
+bootlog.defer('code: mount usb_connected=%s writable=%s'
+	% (supervisor.runtime.usb_connected, WRITABLE))
+bootlog.flush()
+
+if _pending_failure is not None:
+	# Display never came up. The log is on disk now, so fail loudly.
+	raise _pending_failure
+
+# Button last: claiming board.BUTTON_UP before the matrix is built risks the
+# HUB75 driver finding a pin already in use. This way a conflict costs only the
+# UP-button shortcut, which _update_button() swallows, not the whole board.
 up_button = _update_button()
 bootlog.append('code: button=%s, free=%d' % (up_button is not None, gc.mem_free()))
 
