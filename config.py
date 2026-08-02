@@ -51,9 +51,7 @@ config = {
 	'loading_min_text': '---',
 	'loading_line_color': dim_color(0xFF00FF), # Something something Purple Line joke
 
-	# OTA smoke test: extra T in DEST. Same 13 characters, so it cannot overflow
-	# the 64px width (12.8 chars at 5px). Revert once the update is confirmed.
-	'heading_text': 'LN DESTT  MIN',
+	'heading_text': 'LN DEST   MIN',
 	'heading_color': dim_color(0xFF0000),
 
 	'train_line_height': 6,
