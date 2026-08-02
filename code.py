@@ -104,6 +104,14 @@ def check_for_update():
 		print(f'OTA: up to date ({local})')
 		return
 
+	attempts = rollback.ota_attempts(remote)
+	if attempts >= rollback.MAX_OTA_ATTEMPTS:
+		# Don't even hand off. Every handoff costs a reboot, so a version that
+		# will not install would otherwise cycle the board indefinitely.
+		bootlog.append('OTA: %s failed %d times already — not retrying'
+			% (remote, attempts))
+		return
+
 	print(f'OTA: {local or "unknown"} -> {remote}, handing off to ota.py')
 	supervisor.set_next_code_file('ota.py')
 	supervisor.reload()

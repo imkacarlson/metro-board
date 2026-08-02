@@ -21,6 +21,13 @@ NVM_HEALTH_SLOT = 0
 MAX_FAILED_BOOTS = 3
 COPY_CHUNK = 512
 
+# A version that keeps failing to install must stop being retried. ota.py hard
+# resets back into code.py when an update fails, and code.py checks for updates
+# on every boot — so without a cap, one bad publish means a reboot loop every
+# ~15 seconds, rewriting the backup each time.
+OTA_STATE_FILE = '/ota_state.txt'
+MAX_OTA_ATTEMPTS = 3
+
 
 def exists(path):
     try:
@@ -63,6 +70,35 @@ def set_failed_boots(n):
     if n > 254:
         n = 254
     microcontroller.nvm[NVM_HEALTH_SLOT:NVM_HEALTH_SLOT + 1] = bytes([n])
+
+
+def ota_attempts(version):
+    """How many times installing this exact version has already been tried."""
+    parts = read_line(OTA_STATE_FILE).split(' ')
+    if len(parts) == 2 and parts[0] == version:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def record_ota_attempt(version):
+    """Count an attempt *before* it runs, so a crash mid-install still counts."""
+    n = ota_attempts(version) + 1
+    try:
+        with open(OTA_STATE_FILE, 'w') as f:
+            f.write('%s %d' % (version, n))
+    except OSError as e:
+        print('rollback: could not record OTA attempt:', e)
+    return n
+
+
+def clear_ota_state():
+    try:
+        os.remove(OTA_STATE_FILE)
+    except OSError:
+        pass
 
 
 def snapshot():

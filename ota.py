@@ -16,6 +16,22 @@ import json
 import supervisor
 import microcontroller
 
+import rollback
+
+# CircuitPython keeps displays alive across a soft reload on purpose, and
+# code.py gets here via supervisor.reload() — so the RGBMatrix framebuffer is
+# still allocated. That buffer comes from the same pool flash writes draw on,
+# and this file is about to write ~88 KB (backup plus downloads). Six log lines
+# were once enough to starve that pool, so hand the framebuffer back first.
+# The screen going dark is also a useful "updating now" indicator.
+try:
+    import displayio
+    displayio.release_displays()
+    gc.collect()
+    print('ota: released the display, %d bytes free' % gc.mem_free())
+except Exception as e:
+    print('ota: could not release the display:', e)
+
 # Pinned. Owner, repo and branch are fixed here and the manifest is never
 # allowed to contribute any part of a URL — see _install().
 OWNER_REPO = 'imkacarlson/metro-board'
@@ -229,9 +245,19 @@ def _install():
     local = _read_line(VERSION_FILE)
     if version == local:
         print('ota: already on', version)
+        rollback.clear_ota_state()
         return
 
-    print('ota: %s -> %s (%d files)' % (local or 'unknown', version, len(files)))
+    # Count the attempt before doing any work, so an install that dies partway
+    # through still counts against the cap rather than retrying forever.
+    attempt = rollback.record_ota_attempt(version)
+    if attempt > rollback.MAX_OTA_ATTEMPTS:
+        print('ota: %s has failed %d times, giving up until a new version'
+              % (version, attempt - 1))
+        return
+
+    print('ota: %s -> %s (%d files), attempt %d'
+          % (local or 'unknown', version, len(files), attempt))
 
     _back_up(files)
     try:
@@ -244,6 +270,7 @@ def _install():
         raise
 
     _commit(files, version)
+    rollback.clear_ota_state()
 
 
 try:
