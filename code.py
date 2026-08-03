@@ -23,7 +23,6 @@ from metro_api import MetroApi, MetroApiOnFireException
 bootlog.defer('code: metro_api ok, free=%d' % gc.mem_free())
 
 STATION_CODE = config['metro_station_code']
-TRAIN_GROUP = config['train_group']
 REFRESH_INTERVAL = config['refresh_interval']
 NO_SERVICE_START_HOUR = config['no_service_start_hour']
 NO_SERVICE_END_HOUR = config['no_service_end_hour']
@@ -178,7 +177,7 @@ def refresh_trains() -> [dict]:
 		return []
 
 	try:
-		return MetroApi.fetch_train_predictions(STATION_CODE, TRAIN_GROUP)
+		return MetroApi.fetch_train_predictions(STATION_CODE)
 	except MetroApiOnFireException:
 		print('WMATA Api is currently on fire. Trying again later ...')
 		return None
