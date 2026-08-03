@@ -23,9 +23,6 @@ config = {
 	# Metro Station Code
 	'metro_station_code': 'A03',
 
-	# Metro Train Group
-	'train_group': '1',
-
 	# API Key for WMATA — sourced from settings.toml, never committed
 	'metro_api_key': _METRO_API_KEY,
 
@@ -75,8 +72,16 @@ config = {
 	'walk_to_dupont'      : 7,   # min door → station
 	'ride_dupont_to_mc'   : 3,   # min on the Red line
 	'walk_transfer'       : 1,   # min Red platform → lower
-	'skip_threshold'      : 3,   # max Metro Ctr wait you'll tolerate
-	'max_mc_predictions'  : 8,   # how many BL/OR/SV preds we keep (legacy, unused)
+
+	# Skip a Glenmont train when the next one still reaches an eastbound within
+	# this many minutes of the one this train catches. 0 means "only if it is
+	# literally the same departure"; a couple of minutes of slack absorbs the
+	# noise in upstream predictions.
+	'skip_tolerance'      : 2,
+
+	# How far apart (min) a modelled Tenleytown arrival and a measured Dupont
+	# arrival can be and still be believed to be the same train.
+	'dupont_match_window' : 3,
 
 	# Transfer intelligence time window (weekday mornings only)
 	'transfer_start_hour'   : 6,   # Transfer intelligence starts at 6:45 AM

@@ -11,7 +11,9 @@ BL_PRED_SOURCE = config['bl_pred_source']
 RD_GLEN_PRED_SOURCE = config['rd_glen_pred_source']
 WALK_TRANSFER = config['walk_transfer']
 RIDE_DUPONT_TO_MC = config['ride_dupont_to_mc']
-SKIP_THRESHOLD = config['skip_threshold']
+SKIP_TOLERANCE = config['skip_tolerance']
+DUPONT_MATCH_WINDOW = config['dupont_match_window']
+LOADING_MIN_TEXT = config['loading_min_text']
 NUM_TRAINS = config['num_trains']
 TRANSFER_START_HOUR = config['transfer_start_hour']
 TRANSFER_START_MINUTE = config['transfer_start_minute']
@@ -34,6 +36,12 @@ if not METRO_API_KEY:
 # northbound row alive across service changes: during the 2025 summer shutdown
 # these trains terminate at Friendship Heights, not Shady Grove.
 NORTHBOUND_GROUP = '2'
+SOUTHBOUND_GROUP = '1'
+
+# How long the last good board stays believable once refreshes start failing.
+# 90 s is ~18 missed refreshes at the 5 s interval — past that we stop claiming
+# to know anything about connections.
+STALE_AFTER = 90
 
 # Optimized networking globals
 _network = None
@@ -134,15 +142,22 @@ def optimized_fetch(api_path):
         
         return trains
         
+    except (RuntimeError, TimeoutError, OSError) as e:
+        # Network trouble is the caller's business: swallowing it here is what
+        # made METRO_API_RETRIES a no-op and MetroApiOnFireException unreachable.
+        print(f"Optimized fetch network error: {e}")
+        gc.collect()
+        raise
+
     except Exception as e:
         print(f"Optimized fetch failed: {e}")
         gc.collect()
         return []
 
-_mc_east_predictions = []      # [(line_code, min_int), …]   ≤ config['max_mc_predictions']
 _osv_preds = []   # Clarendon / Courthouse  OR/SV
 _bl_preds  = []   # Pentagon / Arlington   BL
-_rd_glen_preds = []   # arrival mins @Dupont for Glenmont trains
+_rd_glen_preds = []   # arrival mins @Dupont for Glenmont trains, modelled from Tenleytown
+_rd_south_measured = []  # arrival mins @Dupont for Glenmont trains, off Dupont's own board
 _rd_north_preds = []  # (destination, arrival mins) @Dupont for northbound trains
 
 # Memory tracking globals
@@ -196,10 +211,6 @@ LINE_SV = 'SV'
 LINE_BL = 'BL'
 LINE_YL = 'YL'
 LINE_GR = 'GR'
-
-# Group constants
-GROUP_1 = '1'
-GROUP_2 = '2'
 
 # Destinations that mean "you cannot board this train"
 NON_PASSENGER = (DEST_NO_PASSENGER, DEST_NOPSSENGER, DEST_SSENGER, DEST_NO_PSNGR)
@@ -357,47 +368,6 @@ def parse_train_fragment(train_json):
         pass
     return None
 
-def stream_parse_trains(json_body):
-    """Legacy parser - kept for compatibility"""
-    trains = []
-    pos = json_body.find('"Trains":[')
-    if pos == -1:
-        return trains
-    
-    pos += 10  # Skip past "Trains":[
-    train_count = 0
-    
-    while pos < len(json_body) and train_count < 50:  # Increased cap for combined response
-        start = json_body.find('{', pos)
-        if start == -1:
-            break
-        
-        end = json_body.find('}', start)
-        if end == -1:
-            break
-        
-        train_fragment = json_body[start:end+1]
-        
-        line = extract_field(train_fragment, '"Line":"')
-        dest = extract_field(train_fragment, '"Destination":"')
-        mins = extract_field(train_fragment, '"Min":"')
-        group = extract_field(train_fragment, '"Group":"')
-        location = extract_field(train_fragment, '"LocationCode":"')
-        
-        if line and dest and location:
-            trains.append({
-                'Line': line,
-                'Destination': dest, 
-                'Min': mins or '0',
-                'Group': group or '1',
-                'LocationCode': location
-            })
-            train_count += 1
-        
-        pos = end + 1
-    
-    return trains
-
 def extract_field(fragment, field_prefix):
     """Extract a single field value from a JSON fragment"""
     start = fragment.find(field_prefix)
@@ -409,7 +379,7 @@ def extract_field(fragment, field_prefix):
         return None
     return fragment[start:end]
 
-def fetch_simple_dupont_trains(station_code: str, group: str) -> [dict]:
+def fetch_simple_dupont_trains(station_code: str) -> [dict]:
     """Memory-efficient single-station fetch for non-transfer hours"""
     import gc
     import time
@@ -438,8 +408,8 @@ def fetch_simple_dupont_trains(station_code: str, group: str) -> [dict]:
             if dest in NON_PASSENGER:
                 continue
 
-            mins = MetroApi._safe_int(t.get('Min', 0))
-            if mins >= 7:
+            mins = MetroApi._parse_min(t.get('Min'))
+            if mins is not None and mins >= 7:
                 line_color = MetroApi._get_line_color(t.get('Line', ''))
                 dest = normalize_destination(dest)
 
@@ -466,10 +436,10 @@ def fetch_simple_dupont_trains(station_code: str, group: str) -> [dict]:
 
 class MetroApi:
     @staticmethod
-    def fetch_train_predictions(station_code: str, group: str) -> [dict]:
+    def fetch_train_predictions(station_code: str) -> [dict]:
         import gc
         import time
-        global _network, _request_count, _mc_east_predictions, _osv_preds, _bl_preds, _rd_glen_preds, _rd_north_preds
+        global _network, _request_count, _osv_preds, _bl_preds, _rd_glen_preds, _rd_south_measured, _rd_north_preds
         global _last_sync_time, _sync_interval
         
         # Sync with time server every ~3 hours
@@ -480,7 +450,7 @@ class MetroApi:
         # Check if we should use transfer intelligence or simple mode
         if not is_transfer_intelligence_time():
             print("⏰ Outside transfer hours - using simple mode")
-            return fetch_simple_dupont_trains(station_code, group)
+            return fetch_simple_dupont_trains(station_code)
         
         print("⏰ Transfer intelligence time - using full complexity mode")
         _init_network()
@@ -512,14 +482,15 @@ class MetroApi:
                 all_trains = optimized_fetch(api_path)
                 if not all_trains:
                     print("❌ No train data received from combined API call")
-                    return getattr(MetroApi, '_last_display_data', [])
+                    return MetroApi._fallback_display()
 
                 # Clear all prediction caches
                 _osv_preds.clear()
                 _bl_preds.clear()
                 _rd_glen_preds.clear()
+                _rd_south_measured.clear()
                 _rd_north_preds.clear()
-                
+
                 # Process all trains from the single response
                 main_display_trains = []
                 for t in all_trains:
@@ -527,21 +498,33 @@ class MetroApi:
                     
                     # Upstream OR/SV predictions (Clarendon)
                     if loc == osv_station and t['Line'] in (LINE_OR, LINE_SV) and t['Destination'] in (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO):
-                        mins = MetroApi._safe_int(t['Min']) + osv_offset
-                        if mins >= WALK_TRANSFER + 1:
-                            _osv_preds.append((str(t['Line']), mins))
+                        mins = MetroApi._parse_min(t['Min'])
+                        if mins is None:
+                            continue
+                        _osv_preds.append((str(t['Line']), mins + osv_offset))
 
                     # Upstream BL predictions (Pentagon)
                     elif loc == bl_station and t['Line'] == LINE_BL and t['Destination'] in (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO):
-                        mins = MetroApi._safe_int(t['Min']) + bl_offset
-                        if mins >= WALK_TRANSFER + 1:
-                            _bl_preds.append((str(t['Line']), mins))
+                        mins = MetroApi._parse_min(t['Min'])
+                        if mins is None:
+                            continue
+                        _bl_preds.append((str(t['Line']), mins + bl_offset))
 
                     # Upstream RD-Glenmont predictions (Tenleytown)
                     elif loc == rd_glen_station and t['Line'] == LINE_RD and t['Destination'] == DEST_GLENMONT:
-                        mins = MetroApi._safe_int(t['Min']) + rd_glen_offset
-                        if mins >= 7:
-                            _rd_glen_preds.append(mins)
+                        mins = MetroApi._parse_min(t['Min'])
+                        if mins is not None and mins + rd_glen_offset >= 7:
+                            _rd_glen_preds.append(mins + rd_glen_offset)
+
+                    # Dupont's own southbound board. Same trains as the Tenleytown
+                    # model once they are close enough for Dupont to see them, but
+                    # measured rather than modelled — see _overlay_measured.
+                    elif loc == main_station and t['Line'] == LINE_RD and t['Group'] == SOUTHBOUND_GROUP:
+                        if t['Destination'] != DEST_GLENMONT:
+                            continue
+                        mins = MetroApi._parse_min(t['Min'])
+                        if mins is not None:
+                            _rd_south_measured.append(mins)
 
                     # Northbound, straight off Dupont's own board. No destination
                     # filter and no offset — these trains stop here. Group is the
@@ -549,21 +532,24 @@ class MetroApi:
                     elif loc == main_station and t['Line'] == LINE_RD and t['Group'] == NORTHBOUND_GROUP:
                         if t['Destination'] in NON_PASSENGER:
                             continue
-                        mins = MetroApi._safe_int(t['Min'])
-                        if mins >= 7:
+                        mins = MetroApi._parse_min(t['Min'])
+                        if mins is not None and mins >= 7:
                             _rd_north_preds.append((normalize_destination(t['Destination']), mins))
-                
+
                 del all_trains
                 gc.collect()
 
                 # Sort Red Line caches by arrival time (earliest first)
                 _rd_glen_preds.sort()
+                _rd_south_measured.sort()
                 _rd_north_preds.sort(key=lambda p: p[1])
 
-                print(f"✅ Cached: {len(_osv_preds)} OR/SV, {len(_bl_preds)} BL, {len(_rd_glen_preds)} RD-Glen, {len(_rd_north_preds)} RD-North")
+                print(f"✅ Cached: {len(_osv_preds)} OR/SV, {len(_bl_preds)} BL, {len(_rd_glen_preds)} RD-Glen, {len(_rd_south_measured)} RD-South, {len(_rd_north_preds)} RD-North")
+
+                glen_mins = MetroApi._overlay_measured(_rd_glen_preds, _rd_south_measured, DUPONT_MATCH_WINDOW)
 
                 # Rehydrate predictions into the main display list
-                for m in _rd_glen_preds:
+                for m in glen_mins:
                     main_display_trains.append({'line_color': MetroApi._get_line_color(LINE_RD), 'destination': DEST_GLENMONT, 'arrival': str(m), 'skip_mode': False, 'skip_reason': None})
                 for dest, m in _rd_north_preds:
                     main_display_trains.append({'line_color': MetroApi._get_line_color(LINE_RD), 'destination': dest, 'arrival': str(m), 'skip_mode': False, 'skip_reason': None})
@@ -571,26 +557,24 @@ class MetroApi:
                 # Sort all trains by arrival time
                 main_display_trains.sort(key=MetroApi._safe_sort_key)
 
-                # Filter to trains 7+ minutes away and take the top N FIRST
+                # Filter to trains 7+ minutes away — the whole list, not just the
+                # top N. The third row's SKIP decision needs a successor to
+                # compare against, so the cut to NUM_TRAINS happens afterwards.
                 filtered_trains = []
-                count = 0
                 for t in main_display_trains:
                     if isinstance(t['arrival'], str) and t['arrival'].isdigit() and int(t['arrival']) >= 7:
                         filtered_trains.append(t)
-                        count += 1
-                        if count >= NUM_TRAINS:
-                            break
 
-                # Apply transfer logic only to trains that will actually be displayed
                 all_east_preds = _osv_preds + _bl_preds
                 all_east_preds.sort(key=lambda p: p[1]) # Sort by arrival time
                 MetroApi._apply_transfer_logic(filtered_trains, all_east_preds)
-                
-                display_trains = filtered_trains
-                del main_display_trains
+
+                display_trains = filtered_trains[:NUM_TRAINS]
+                del main_display_trains, filtered_trains
                 gc.collect()
                 MetroApi._last_display_data = display_trains
-                
+                MetroApi._last_data_time = time.monotonic()
+
                 del all_east_preds
                 gc.collect()
                 log_memory("After processing complete")
@@ -600,18 +584,72 @@ class MetroApi:
             except (RuntimeError, TimeoutError, OSError) as e:
                 print(f'Network error: {e}')
                 gc.collect()
-                if i < METRO_API_RETRIES:
-                    pass
-                else:
-                    raise MetroApiOnFireException()
-    
+                if i >= METRO_API_RETRIES:
+                    return MetroApi._fallback_display()
+
+    # Set once a refresh succeeds; read by _fallback_display.
+    _last_display_data = None
+    _last_data_time = 0
+
     @staticmethod
-    def _safe_int(val):
+    def _parse_min(val):
+        """Minutes as an int, or None when WMATA has no estimate.
+
+        BRD/ARR are imminent. Anything else (---, DLY, empty) carries no time
+        information; returning 0 for it invents a train that does not exist.
+        """
         try:
             return int(val)
-        except ValueError:
-            return 0
-    
+        except (ValueError, TypeError):
+            pass
+        return 0 if val in ('BRD', 'ARR') else None
+
+    @staticmethod
+    def _fallback_display():
+        """The last good board, degraded honestly once it ages out.
+
+        Raises only on a cold start, where there is nothing to show and blanking
+        the display is the truthful answer.
+        """
+        import time
+        prior = MetroApi._last_display_data
+        if not prior:
+            raise MetroApiOnFireException()
+
+        if time.monotonic() - MetroApi._last_data_time < STALE_AFTER:
+            return prior
+
+        # Too old to stand behind. Keep the destinations, drop every claim that
+        # depends on the clock — especially the connection colour.
+        for t in prior:
+            t['arrival'] = LOADING_MIN_TEXT
+            t['skip_mode'] = False
+            t['skip_reason'] = None
+            if t['destination'] == DEST_GLENMONT:
+                t['line_color'] = MetroApi._get_line_color(LINE_RD)
+        return prior
+
+    @staticmethod
+    def _overlay_measured(modeled, measured, window):
+        """Prefer Dupont's own figure where the same train appears in both sorted
+        lists. Trains >7 min out are still behind Tenleytown, so they show in both."""
+        if not measured:
+            return modeled
+
+        out = []
+        j = 0
+        for m in modeled:
+            while j < len(measured) and measured[j] < m - window:
+                j += 1
+            if j < len(measured) and measured[j] <= m + window:
+                out.append(measured[j])
+                j += 1
+            else:
+                out.append(m)
+        out.sort()
+        return out
+
+
     @staticmethod
     def _safe_sort_key(t):
         arrival = t['arrival']
@@ -644,61 +682,51 @@ class MetroApi:
 
     @staticmethod
     def _apply_transfer_logic(all_trains, mc_preds):
+        """Mark each Glenmont train TAKE or SKIP based on the eastbound it catches.
+
+        The question is about *time*, not identity: skip a train when waiting for
+        the next one still puts you on an eastbound no later than this one does.
+        Asking it that way survives duplicate entries for a single train — both
+        lookups land on the same minute and the skip fires anyway.
+        """
         offset = RIDE_DUPONT_TO_MC + WALK_TRANSFER
-        thresh = SKIP_THRESHOLD
 
         glen_trains = [t for t in all_trains if t['destination'] == DEST_GLENMONT]
         if not glen_trains:
             return
 
         print(f"🧠 Applying transfer logic to {len(glen_trains)} Glenmont train(s) with {len(mc_preds)} connection(s).")
-        conn_indices = []
+        conns = []
 
         for i, t in enumerate(glen_trains):
             eta = int(t['arrival']) + offset
             print(f"  - Glenmont train #{i+1} (arrives Dupont in {t['arrival']} min):")
             print(f"    - Calculated ETA at Metro Center: {eta} min")
 
-            conn_idx = None
-            for j, p in enumerate(mc_preds):
+            conn = None
+            for p in mc_preds:
                 if p[1] >= eta:
-                    conn_idx = j
-                    print(f"    - Found potential connection: #{j+1} ({p[0]} line in {p[1]} min)")
+                    conn = p
+                    print(f"    - Found potential connection: {p[0]} line in {p[1]} min")
                     break
-            
-            if conn_idx is None:
+
+            if conn is None:
                 print("    - No suitable connection found.")
-            conn_indices.append(conn_idx)
+            conns.append(conn)
 
         for i, t in enumerate(glen_trains):
-            skip = False
-            reason = ""
-            
-            # Reason 1: Next Glenmont train catches the exact same connecting train
-            if i + 1 < len(conn_indices) and conn_indices[i] is not None and conn_indices[i] == conn_indices[i+1]:
-                skip = True
-                skip_reason = "efficiency"
-                reason = f"Next Glenmont train also makes connection #{conn_indices[i]+1}"
-            # Reason 2: No connection is available at all for this train
-            elif conn_indices[i] is None:
-                skip = True
-                skip_reason = "no_data"
-                reason = "No connection available"
+            conn = conns[i]
+            nxt = conns[i + 1] if i + 1 < len(conns) else None
 
             print(f"  - Decision for Glenmont train #{i+1}:")
-            if skip:
+            if conn is None:
                 t['skip_mode'] = True
-                t['skip_reason'] = skip_reason
-                print(f"    - SKIP ⏭️ ({reason}) [reason: {skip_reason}]")
+                t['skip_reason'] = "no_data"
+                print("    - SKIP ⏭️ (No connection available) [reason: no_data]")
+            elif nxt is not None and nxt[1] - conn[1] <= SKIP_TOLERANCE:
+                t['skip_mode'] = True
+                t['skip_reason'] = "efficiency"
+                print(f"    - SKIP ⏭️ (Next Glenmont train reaches an eastbound at {nxt[1]} min vs {conn[1]}) [reason: efficiency]")
             else:
-                conn_idx = conn_indices[i]
-                if conn_idx is not None:
-                    target_line = mc_preds[conn_idx][0]
-                    line_color = MetroApi._get_line_color(target_line)
-                    t['line_color'] = line_color
-                    print(f"    - TAKE ✅ (Connects to {target_line} line train #{conn_idx+1})")
-                else:
-                    # This case should ideally not be hit due to the logic above, but as a fallback:
-                    t['skip_mode'] = True
-                    t['skip_reason'] = "no_data"
-                    print("    - SKIP ⏭️ (Fallback - no connection index) [reason: no_data]")
+                t['line_color'] = MetroApi._get_line_color(conn[0])
+                print(f"    - TAKE ✅ (Connects to {conn[0]} line train in {conn[1]} min)")
