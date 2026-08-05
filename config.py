@@ -62,14 +62,19 @@ config = {
 	'osv_pred_source' : ('K02', 12),   # Clarendon → MC ≈ 12 min
 	'bl_pred_source'  : ('C07', 13),   # Pentagon  → MC ≈ 13 min
 
-	# Upstream predictor for southbound (Glenmont) Red‑line trains.
+	# Upstream predictor for southbound Red‑line trains.
 	# Northbound is read straight off Dupont's own predictions (Group 2) —
 	# see metro_api.NORTHBOUND_GROUP — so it needs no upstream source and
 	# survives service-pattern changes such as short-turns at Friendship Heights.
-	'rd_glen_pred_source' : ('A07', 7),   # Tenleytown → Dupont ≈ +7 min
+	# 8 is MetroHero's segment sum A07→A06→A05→A04→A03 (2+2+2+2), dwell
+	# included; the old 7 was a guess and ran a minute early. metro_api logs an
+	# OFFSET_OBS line per train so this can be checked against reality.
+	'rd_glen_pred_source' : ('A07', 8),   # Tenleytown → Dupont ≈ +8 min
+
+	# Never show a train you cannot physically reach: door → Dupont platform.
+	'display_floor_min'   : 7,
 
 	# Keith's morning‑commute parameters
-	'walk_to_dupont'      : 7,   # min door → station
 	'ride_dupont_to_mc'   : 3,   # min on the Red line
 	'walk_transfer'       : 1,   # min Red platform → lower
 
