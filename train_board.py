@@ -192,28 +192,21 @@ class Train:
 		destination = train_info['destination']
 		minutes = train_info['arrival']
 
-		# Debug logging to trace display issues
-		print(f"🎨 Display update: {destination} in {minutes}min, line_color=0x{line_color:06X}")
-
-		# Handle the special coloring for Glenmont transfers
-		if destination == 'Glenmont':
+		# Transfer treatment keys on direction, not on a destination string: every
+		# southbound train rides to Metro Center, whatever it terminates at.
+		if train_info.get('southbound', False):
 			if train_info.get('skip_mode', False):
-				skip_reason = train_info.get('skip_reason', 'unknown')
-				if skip_reason == 'efficiency':
+				if train_info.get('skip_reason') == 'efficiency':
 					# "Smart Skip": Next train gets same connection → blink yellow
-					print(f"    → Smart skip mode (efficiency - blink yellow)")
 					self.set_line_color(0, 0, skip_mode=True)
 				else:
 					# "No Data Skip": No connection visible → solid red
-					print(f"    → No data skip mode (no_data - solid red)")
 					self.set_line_color(dim_color(0xFF0000), dim_color(0xFF0000))
 			else:
 				# "Take" train: Red top, connection color bottom
-				print(f"    → Take mode (red top, 0x{line_color:06X} bottom)")
 				self.set_line_color(dim_color(0xFF0000), line_color)
 		else:
 			# Standard train (e.g., Shady Grove): Solid color bar
-			print(f"    → Standard mode (solid 0x{line_color:06X})")
 			self.set_line_color(line_color, line_color) # Set both halves to the same color
 
 		self.set_destination(destination)
