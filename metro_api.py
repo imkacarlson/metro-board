@@ -22,6 +22,11 @@ TRANSFER_START_MINUTE = config['transfer_start_minute']
 TRANSFER_END_HOUR = config['transfer_end_hour']
 TRANSFER_END_MINUTE = config['transfer_end_minute']
 
+MAIN_STATION = config['metro_station_code']
+OSV_STATION = OSV_PRED_SOURCE[0]
+BL_STATION = BL_PRED_SOURCE[0]
+RD_GLEN_STATION = RD_GLEN_PRED_SOURCE[0]
+
 # Delete config dict after extracting constants
 del config
 
@@ -102,8 +107,12 @@ def update_system_time():
         _last_sync_time = time.time() - _sync_interval + (30 * 60)
         return time.localtime(), False
 
-def optimized_fetch(api_path):
-    """Ultra-memory-efficient fetch with direct chunk parsing - no string assembly"""
+def optimized_fetch(api_path, keep=None):
+    """Ultra-memory-efficient fetch with direct chunk parsing - no string assembly
+
+    `keep(loc, line, dest)` decides which rows are worth a dict at all. Passing
+    None retains everything, which is what every caller used to do.
+    """
     global _network
     import gc
     
@@ -138,7 +147,7 @@ def optimized_fetch(api_path):
         # Make request
         response = _network.fetch(api_url, headers={'api_key': METRO_API_KEY})
         # REVOLUTIONARY APPROACH: Parse directly from chunks without building full string
-        trains = direct_chunk_parse_trains(response)
+        trains = direct_chunk_parse_trains(response, keep)
         
         # Close response immediately after parsing
         response.close() 
@@ -236,6 +245,11 @@ LINE_GR = 'GR'
 
 # Destinations that mean "you cannot board this train"
 NON_PASSENGER = (DEST_NO_PASSENGER, DEST_NOPSSENGER, DEST_SSENGER, DEST_NO_PSNGR)
+
+# Eastbound out of Metro Center: the connection we are trying to catch. One
+# spelling of this set, shared by the parse-time filter and the branches it
+# mirrors, so the two cannot drift apart.
+EAST_DESTS = (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO)
 
 # Southbound destinations that never reach Metro Center, as substrings.
 # Substrings because WMATA abbreviates unpredictably — see the four spellings
@@ -398,14 +412,26 @@ def log_memory(label):
     
     return free
 
-def direct_chunk_parse_trains(response):
+# Two different jobs, so two different counters. `train_count >= 50` used to be
+# both the memory bound and the runaway bound; once most rows are filtered out
+# a retained-only cap would leave the loop unbounded over the stream.
+RAW_MAX = 240   # every {...} seen: the real runaway guard
+KEEP_MAX = 40   # retained rows: a ceiling, not a target — expect 12-18
+
+_last_raw_count = 0  # rows seen by the last parse, for the ✅ Cached: line
+
+
+def direct_chunk_parse_trains(response, keep=None):
     """Revolutionary zero-string-assembly parser that processes HTTP chunks directly"""
     import gc
+    global _last_raw_count
     trains = []
     
     # State machine for incremental JSON parsing
     buffer = ""  # Small rolling buffer for incomplete JSON fragments
-    train_count = 0
+    raw_count = 0
+    chunks = 0
+    _last_raw_count = 0
     in_trains_array = False
     brace_depth = 0
     current_train = ""
@@ -465,12 +491,15 @@ def direct_chunk_parse_trains(response):
                         brace_depth -= 1
                         if brace_depth == 0:
                             # Complete train object found - parse it immediately
-                            train_data = parse_train_fragment(current_train)
+                            train_data = parse_train_fragment(current_train, keep)
+                            raw_count += 1
+                            _last_raw_count = raw_count
                             if train_data:
                                 trains.append(train_data)
-                                train_count += 1
-                                if train_count >= 50:  # Prevent runaway parsing
+                                if len(trains) >= KEEP_MAX:
                                     return trains
+                            if raw_count >= RAW_MAX:  # Prevent runaway parsing
+                                return trains
                             
                             # Reset for next train
                             current_train = ""
@@ -483,8 +512,12 @@ def direct_chunk_parse_trains(response):
                     buffer = ""
                     break
             
-            # Memory management - force garbage collection every few chunks
-            if train_count % 10 == 0:
+            # Memory management - force garbage collection every few chunks.
+            # Keyed on chunks, not on retained rows: with a filter in place the
+            # retained count sits at 0 through most of the stream, which made
+            # the old `% 10` expression true on every single chunk.
+            chunks += 1
+            if chunks % 8 == 0:
                 gc.collect()
             
             # Safety: prevent buffer from growing too large
@@ -498,16 +531,20 @@ def direct_chunk_parse_trains(response):
     
     return trains
 
-def parse_train_fragment(train_json):
+def parse_train_fragment(train_json, keep=None):
     """Parse a single complete train JSON object - ultra-lightweight"""
     try:
         line = extract_field(train_json, '"Line":"')
         dest = extract_field(train_json, '"Destination":"')
-        mins = extract_field(train_json, '"Min":"')
-        group = extract_field(train_json, '"Group":"')
         location = extract_field(train_json, '"LocationCode":"')
         
+        # Malformed fragments are dropped before `keep` is consulted, which is
+        # exactly today's semantics — a predicate cannot resurrect one.
         if line and dest and location:
+            if keep is not None and not keep(location, line, dest):
+                return None
+            mins = extract_field(train_json, '"Min":"')
+            group = extract_field(train_json, '"Group":"')
             return {
                 'Line': line,
                 'Destination': dest, 
@@ -530,6 +567,13 @@ def extract_field(fragment, field_prefix):
         return None
     return fragment[start:end]
 
+# Off-peak: one station, and the only rows worth a dict are ones you can board.
+# Plain module-level function, not a closure — a closure allocates a cell plus a
+# function object per refresh, in the hot path.
+def keep_simple_row(loc, line, dest):
+    return dest not in NON_PASSENGER
+
+
 def fetch_simple_dupont_trains(station_code: str) -> [dict]:
     """Memory-efficient single-station fetch for non-transfer hours"""
     import gc
@@ -546,7 +590,7 @@ def fetch_simple_dupont_trains(station_code: str) -> [dict]:
     api_path = station_code
     
     try:
-        all_trains = optimized_fetch(api_path)
+        all_trains = optimized_fetch(api_path, keep_simple_row)
         if not all_trains:
             print("❌ No train data received from simple API call")
             return []
@@ -584,6 +628,25 @@ def fetch_simple_dupont_trains(station_code: str) -> [dict]:
         gc.collect()
         return []
 
+# Mirrors the station/line/destination clauses of the elif chain in
+# fetch_train_predictions below, one clause per branch. Route identity only —
+# never Min, never Group — which makes this a strict over-approximation of what
+# the chain keeps: it may retain a row the chain later drops, never the reverse.
+# That property is what makes filtering during the parse behaviour-preserving,
+# and it is the invariant the equivalence test asserts.
+def keep_transfer_row(loc, line, dest):
+    if loc == OSV_STATION:      # -> the upstream OR/SV branch (Clarendon)
+        return line in (LINE_OR, LINE_SV) and dest in EAST_DESTS
+    if loc == BL_STATION:       # -> the upstream BL branch (Pentagon)
+        return line == LINE_BL and dest in EAST_DESTS
+    if loc == RD_GLEN_STATION:  # -> the Tenleytown branch. Every direction:
+        return line == LINE_RD  #    the A07 g= diagnostic runs before
+                                #    accept_southbound and needs the rest.
+    if loc == MAIN_STATION:     # -> Dupont's own board, both Groups;
+        return line == LINE_RD  #    direction is decided downstream.
+    return False
+
+
 class MetroApi:
     @staticmethod
     def fetch_train_predictions(station_code: str) -> [dict]:
@@ -617,12 +680,18 @@ class MetroApi:
         all_stations = f"{osv_station},{bl_station},{rd_glen_station},{main_station}"
         api_path = all_stations
 
+        # Safety valve: keep_transfer_row is written against the stations in
+        # config. A caller passing some other station would have every one of
+        # its rows rejected and blank the board, so fall back to retaining
+        # everything, which is exactly today's behaviour.
+        keep = keep_transfer_row if station_code == MAIN_STATION else None
+
         for i in range(METRO_API_RETRIES + 1):
             gc.collect()
             _request_count += 1
 
             try:
-                all_trains = optimized_fetch(api_path)
+                all_trains = optimized_fetch(api_path, keep)
                 if not all_trains:
                     print("❌ No train data received from combined API call")
                     return MetroApi._fallback_display()
@@ -641,14 +710,14 @@ class MetroApi:
                     loc = t['LocationCode']
                     
                     # Upstream OR/SV predictions (Clarendon)
-                    if loc == osv_station and t['Line'] in (LINE_OR, LINE_SV) and t['Destination'] in (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO):
+                    if loc == osv_station and t['Line'] in (LINE_OR, LINE_SV) and t['Destination'] in EAST_DESTS:
                         mins = MetroApi._parse_min(t['Min'])
                         if mins is None:
                             continue
                         _osv_preds.append((str(t['Line']), mins + osv_offset))
 
                     # Upstream BL predictions (Pentagon)
-                    elif loc == bl_station and t['Line'] == LINE_BL and t['Destination'] in (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO):
+                    elif loc == bl_station and t['Line'] == LINE_BL and t['Destination'] in EAST_DESTS:
                         mins = MetroApi._parse_min(t['Min'])
                         if mins is None:
                             continue
@@ -695,6 +764,7 @@ class MetroApi:
                         if mins is not None and mins >= DISPLAY_FLOOR_MIN:
                             _rd_north_preds.append((normalize_destination(t['Destination']), mins))
 
+                n_kept = len(all_trains)
                 del all_trains
                 gc.collect()
 
@@ -703,7 +773,7 @@ class MetroApi:
                 _rd_south_measured.sort()
                 _rd_north_preds.sort(key=lambda p: p[1])
 
-                print(f"✅ Cached: {len(_osv_preds)} OR/SV, {len(_bl_preds)} BL, {len(_rd_glen_preds)} RD-South-model, {len(_rd_south_measured)} RD-South-meas, {len(_rd_north_preds)} RD-North")
+                print(f"✅ Cached: {len(_osv_preds)} OR/SV, {len(_bl_preds)} BL, {len(_rd_glen_preds)} RD-South-model, {len(_rd_south_measured)} RD-South-meas, {len(_rd_north_preds)} RD-North ({n_kept} kept/{_last_raw_count} raw)")
 
                 record_observation(front_t, _rd_south_measured)
 

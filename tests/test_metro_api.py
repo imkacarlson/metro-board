@@ -427,7 +427,8 @@ def _fake_api(monkeypatch):
     def install(rows):
         monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: True)
         monkeypatch.setattr(metro_api, '_init_network', lambda: None)
-        monkeypatch.setattr(metro_api, 'optimized_fetch', lambda path: list(rows))
+        monkeypatch.setattr(metro_api, 'optimized_fetch',
+                            lambda path, keep=None: list(rows))
         monkeypatch.setattr(metro_api, 'log_memory', lambda label: 20000)
         metro_api._prev_front_t = None
         metro_api._obs.clear()
@@ -670,9 +671,13 @@ def test_undecodable_bytes_do_not_kill_the_parse():
 
 
 def test_raw_count_cap_bounds_the_loop():
+    """The runaway guard has to count rows *seen*: with a filter in place a
+    retained-only cap would leave the loop unbounded over the stream."""
     rows = [_train_json('A03', 'RD', 'Glenmont', '5', '1')] * (metro_api.RAW_MAX + 40)
-    trains = direct_chunk_parse_trains(_FakeResponse(_wmata_body(rows)))
-    assert len(trains) <= metro_api.RAW_MAX
+    trains = direct_chunk_parse_trains(_FakeResponse(_wmata_body(rows)),
+                                       lambda loc, line, dest: False)
+    assert trains == []
+    assert metro_api._last_raw_count == metro_api.RAW_MAX
 
 
 def test_retained_count_cap_bounds_the_list():
@@ -799,10 +804,11 @@ def test_a_station_code_disagreeing_with_config_disables_the_filter(_wire_api,
             _train_json('B35', 'RD', 'Shady Grove', '9', '2')]
     _wire_api(_wmata_body(rows))
     out = MetroApi.fetch_train_predictions('B35')
-    # Nothing matches the elif chain for B35, so the board is empty either way —
-    # what matters is that the *parser* still returned the rows.
-    assert out == []
-    assert '0 OR/SV' in capsys.readouterr().out
+    # With the filter wrongly enabled every B35 row would be rejected during the
+    # parse and the board would come up blank. Falling back to keep=None
+    # degrades to today's behaviour instead.
+    assert [t['destination'] for t in out] == ['Shady Gro']
+    assert '2 kept/2 raw' in capsys.readouterr().out
 
 
 def test_the_a07_diagnostic_still_sees_a_northbound_row(_wire_api, capsys):
