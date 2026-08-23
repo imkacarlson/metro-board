@@ -19,6 +19,7 @@ from config import config
 bootlog.defer('code: config ok, free=%d' % gc.mem_free())
 from train_board import TrainBoard
 bootlog.defer('code: train_board ok, free=%d' % gc.mem_free())
+import metro_api
 from metro_api import MetroApi, MetroApiOnFireException
 bootlog.defer('code: metro_api ok, free=%d' % gc.mem_free())
 
@@ -249,6 +250,13 @@ while True:
 		if current_time - last_refresh >= REFRESH_INTERVAL:
 			train_board.refresh()
 			last_refresh = current_time
+
+			# Drain whatever metro_api staged about the board that just went out.
+			# Here, not in the fetch path: refresh() has returned, so the big
+			# lists are freed and flash is safe to touch.
+			if metro_api._note is not None:
+				bootlog.append(metro_api._note)
+				metro_api._note = None
 
 			if not _marked_healthy:
 				# Order matters: prove this build works and clear the rollback

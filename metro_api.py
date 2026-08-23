@@ -119,6 +119,14 @@ def optimized_fetch(api_path):
     if free_before < 10000:  # Increase threshold 
         print(f"⚠️ Memory fragmentation detected ({free_before} bytes free)")
         print("🔄 Performing emergency memory reset...")
+        # The reload used to leave nothing behind: 34 boot cycles were logged
+        # with zero exception lines, because this path never wrote one. req= is
+        # the load-bearing field — free_before is measured *before* the fetch,
+        # so a reload at req=1 would mean the shortfall is boot-time baseline
+        # (matrix, TLS, font) rather than peak retention during the parse.
+        import bootlog
+        bootlog.append('fetch: reload, free=%d req=%d xfer=%s'
+                       % (free_before, _request_count, is_transfer_intelligence_time()))
         # NUCLEAR OPTION: supervisor.reload() to completely reset memory
         import supervisor
         supervisor.reload()
@@ -167,6 +175,16 @@ _prev_front_t = None  # previous refresh's front Tenleytown Min
 
 OBS_TRIGGER = 4  # observe when the front Tenleytown train crosses this
 OBS_KEEP = 5     # samples kept; small ints, ~100 bytes
+
+# One staged observation about the board that just went out, or None. Written
+# here, drained by code.py after train_board.refresh() returns — nothing in the
+# fetch path may touch flash, so this follows the same defer/flush discipline
+# bootlog already encodes.
+_note = None
+_note_sig = None    # identifies the *situation*, so a pair that persists across
+                    # ~24 refreshes is recorded once rather than 24 times
+_note_count = 0
+NOTE_MAX = 6        # per boot; a stuck board must not become a flash-wear source
 
 # Memory tracking globals
 _max_mem_seen = 0
@@ -306,6 +324,52 @@ def record_observation(front_t, measured):
     s = sorted(_obs)
     print(f"OFFSET_OBS t={front_t} d={front_t + implied} implied={implied} median={s[len(s) // 2]} n={len(s)}")
     return implied
+
+
+def _stage_note(sig, text):
+    """Stage one line for code.py to drain. Overwrites an undrained line:
+    dropping a note beats queuing allocations in the hot path."""
+    global _note, _note_sig, _note_count
+    if sig == _note_sig:
+        return
+    _note_sig = sig
+    if _note_count >= NOTE_MAX:
+        return
+    _note_count += 1
+    _note = text
+
+
+# Two adjacent rows that render the same colour, reported from the field
+# rather than argued about. `dupline` is expected to be correct behaviour — a
+# genuine same-connection pair always trips the skip rule, so a same-colour
+# TAKE pair is two different trains on one line, and the line carries both
+# connection minutes to prove it. `nodata` paints solid red on both halves
+# (train_board.py) and is genuinely indistinguishable to the eye, and is a real
+# bug when it happens.
+def _observe_pairs(south, conns, mc_preds, offset):
+    global _note_sig
+    for i in range(len(south) - 1):
+        a, b = south[i], south[i + 1]
+        ca, cb = conns[i], conns[i + 1]
+        ta, tb = int(a['arrival']), int(b['arrival'])
+
+        if (a['skip_mode'] and b['skip_mode']
+                and a['skip_reason'] == 'no_data' and b['skip_reason'] == 'no_data'):
+            _stage_note(('nodata', tb - ta),
+                        'xfer nodata t=%d/%d eta=%d/%d n_east=%d'
+                        % (ta, tb, ta + offset, tb + offset, len(mc_preds)))
+            return True
+
+        if (not a['skip_mode'] and not b['skip_mode']
+                and ca is not None and cb is not None and ca[0] == cb[0]):
+            _stage_note(('dupline', ca[0], tb - ta, cb[1] - ca[1]),
+                        'xfer dupline=%s t=%d/%d conn=%d/%d tol=%d n_east=%d'
+                        % (ca[0], ta, tb, ca[1], cb[1], SKIP_TOLERANCE, len(mc_preds)))
+            return True
+
+    # A clean board forgets the signature, so a recurrence is recorded again.
+    _note_sig = None
+    return False
 
 
 def log_memory(label):
@@ -798,6 +862,14 @@ class MetroApi:
 
         south_trains = [t for t in all_trains if t.get('southbound')]
         if not south_trains:
+            # The regression guard for the parse-time filter. A predicate bug
+            # produces a silently blank board, and rollback.py cannot catch
+            # that — it counts failed boots, not wrong output.
+            if is_transfer_intelligence_time():
+                _stage_note(('empty',),
+                            'xfer empty n_south=0 n_east=%d n_glen=%d n_meas=%d'
+                            % (len(mc_preds), len(_rd_glen_preds),
+                               len(_rd_south_measured)))
             return
 
         conns = []
@@ -822,6 +894,8 @@ class MetroApi:
                 t['skip_reason'] = "efficiency"
             else:
                 t['line_color'] = MetroApi._get_line_color(conn[0])
+
+        _observe_pairs(south_trains, conns, mc_preds, offset)
 
         skips = sum(1 for t in south_trains if t['skip_mode'])
         print(f"🧠 Transfer: {len(south_trains)} southbound, {len(mc_preds)} conn, {skips} skipped")
