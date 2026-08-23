@@ -45,6 +45,21 @@ if not METRO_API_KEY:
 NORTHBOUND_GROUP = '2'
 SOUTHBOUND_GROUP = '1'
 
+# The point below which a fetch is not attempted at all: the board reloads
+# instead, on the theory that fragmentation is unrecoverable in place.
+#
+# This was 10000, which measurement showed sits *inside* the normal operating
+# band. One HTTPS fetch permanently claims ~54 KB — free goes 64 K -> 10 K
+# across the first refresh and never comes back — so steady state is ~10.8 K
+# with the parse filter in place, and every ordinary fluctuation was tripping a
+# reboot. 23 consecutive cycles of that are in /board.log.1.
+#
+# 7000 keeps the net for genuine exhaustion while leaving ~3.8 KB of ordinary
+# headroom. Note that a fetch which fails outright is *not* fatal:
+# optimized_fetch returns [] and the caller falls back to the last good board,
+# so this reload is a precaution, not the thing standing between us and a crash.
+MEM_FLOOR = 7000
+
 # How long the last good board stays believable once refreshes start failing.
 # 90 s is ~18 missed refreshes at the 5 s interval — past that we stop claiming
 # to know anything about connections.
@@ -116,6 +131,9 @@ def optimized_fetch(api_path, keep=None):
     global _network
     import gc
     
+    global _request_count
+    _request_count += 1
+
     _init_network()
     
     # PROVEN TECHNIQUE: Multiple gc.collect() calls before large allocation
@@ -125,7 +143,7 @@ def optimized_fetch(api_path, keep=None):
     
     # Check memory after cleanup
     free_before = gc.mem_free()
-    if free_before < 10000:  # Increase threshold 
+    if free_before < MEM_FLOOR:
         print(f"⚠️ Memory fragmentation detected ({free_before} bytes free)")
         print("🔄 Performing emergency memory reset...")
         # The reload used to leave nothing behind: 34 boot cycles were logged
@@ -184,16 +202,6 @@ _prev_front_t = None  # previous refresh's front Tenleytown Min
 
 OBS_TRIGGER = 4  # observe when the front Tenleytown train crosses this
 OBS_KEEP = 5     # samples kept; small ints, ~100 bytes
-
-# One staged observation about the board that just went out, or None. Written
-# here, drained by code.py after train_board.refresh() returns — nothing in the
-# fetch path may touch flash, so this follows the same defer/flush discipline
-# bootlog already encodes.
-_note = None
-_note_sig = None    # identifies the *situation*, so a pair that persists across
-                    # ~24 refreshes is recorded once rather than 24 times
-_note_count = 0
-NOTE_MAX = 6        # per boot; a stuck board must not become a flash-wear source
 
 # Memory tracking globals
 _max_mem_seen = 0
@@ -340,76 +348,19 @@ def record_observation(front_t, measured):
     return implied
 
 
-def _stage_note(sig, text):
-    """Stage one line for code.py to drain. Overwrites an undrained line:
-    dropping a note beats queuing allocations in the hot path."""
-    global _note, _note_sig, _note_count
-    if sig == _note_sig:
-        return
-    _note_sig = sig
-    if _note_count >= NOTE_MAX:
-        return
-    _note_count += 1
-    _note = text
-
-
-# Two adjacent rows that render the same colour, reported from the field
-# rather than argued about. `dupline` is expected to be correct behaviour — a
-# genuine same-connection pair always trips the skip rule, so a same-colour
-# TAKE pair is two different trains on one line, and the line carries both
-# connection minutes to prove it. `nodata` paints solid red on both halves
-# (train_board.py) and is genuinely indistinguishable to the eye, and is a real
-# bug when it happens.
-def _observe_pairs(south, conns, mc_preds, offset):
-    global _note_sig
-    for i in range(len(south) - 1):
-        a, b = south[i], south[i + 1]
-        ca, cb = conns[i], conns[i + 1]
-        ta, tb = int(a['arrival']), int(b['arrival'])
-
-        if (a['skip_mode'] and b['skip_mode']
-                and a['skip_reason'] == 'no_data' and b['skip_reason'] == 'no_data'):
-            _stage_note(('nodata', tb - ta),
-                        'xfer nodata t=%d/%d eta=%d/%d n_east=%d'
-                        % (ta, tb, ta + offset, tb + offset, len(mc_preds)))
-            return True
-
-        if (not a['skip_mode'] and not b['skip_mode']
-                and ca is not None and cb is not None and ca[0] == cb[0]):
-            _stage_note(('dupline', ca[0], tb - ta, cb[1] - ca[1]),
-                        'xfer dupline=%s t=%d/%d conn=%d/%d tol=%d n_east=%d'
-                        % (ca[0], ta, tb, ca[1], cb[1], SKIP_TOLERANCE, len(mc_preds)))
-            return True
-
-    # A clean board forgets the signature, so a recurrence is recorded again.
-    _note_sig = None
-    return False
-
-
 def log_memory(label):
-    """Enhanced memory monitoring with stack tracking"""
+    """Collect, report free bytes to serial, and track the low-water mark."""
     import gc
-    import supervisor
-    global _max_mem_seen, _min_mem_seen, _request_count
-    
+    global _max_mem_seen, _min_mem_seen
+
     gc.collect()
     free = gc.mem_free()
-    allocated = gc.mem_alloc()
-    
-    # Track min/max
-    _max_mem_seen = max(_max_mem_seen, free)
-    _min_mem_seen = min(_min_mem_seen, free)
-    
-    # Log detailed stats every 20 cycles
-    if _request_count % 20 == 0:
-        try:
-            stack_size = supervisor.runtime.pystack_size if hasattr(supervisor.runtime, 'pystack_size') else 'N/A'
-            print(f"STATS: free={free}, alloc={allocated}, max_seen={_max_mem_seen}, min_seen={_min_mem_seen}, stack={stack_size}")
-        except:
-            print(f"STATS: free={free}, alloc={allocated}, max_seen={_max_mem_seen}, min_seen={_min_mem_seen}")
-    else:
-        print(f"{label}: {free} bytes free")
-    
+    if free > _max_mem_seen:
+        _max_mem_seen = free
+    if free < _min_mem_seen:
+        _min_mem_seen = free
+
+    print(label, free, 'free, low', _min_mem_seen)
     return free
 
 # Two different jobs, so two different counters. `train_count >= 50` used to be
@@ -644,9 +595,8 @@ def keep_transfer_row(loc, line, dest):
         return line in (LINE_OR, LINE_SV) and dest in EAST_DESTS
     if loc == BL_STATION:       # -> the upstream BL branch (Pentagon)
         return line == LINE_BL and dest in EAST_DESTS
-    if loc == RD_GLEN_STATION:  # -> the Tenleytown branch. Every direction:
-        return line == LINE_RD  #    the A07 g= diagnostic runs before
-                                #    accept_southbound and needs the rest.
+    if loc == RD_GLEN_STATION:  # -> the Tenleytown branch; direction is
+        return line == LINE_RD  #    accept_southbound's business, not ours.
     if loc == MAIN_STATION:     # -> Dupont's own board, both Groups;
         return line == LINE_RD  #    direction is decided downstream.
     return False
@@ -693,7 +643,6 @@ class MetroApi:
 
         for i in range(METRO_API_RETRIES + 1):
             gc.collect()
-            _request_count += 1
 
             try:
                 all_trains = optimized_fetch(api_path, keep)
@@ -736,7 +685,6 @@ class MetroApi:
                     elif loc == rd_glen_station and t['Line'] == LINE_RD:
                         dest = t['Destination']
                         raw = t['Min']
-                        print(f"A07 g={t['Group']} d={dest} m={raw}")
                         if not accept_southbound(t['Group'], dest):
                             continue
                         mins = upstream_min(raw)
@@ -778,7 +726,10 @@ class MetroApi:
                 _rd_south_measured.sort()
                 _rd_north_preds.sort(key=lambda p: p[1])
 
-                print(f"✅ Cached: {len(_osv_preds)} OR/SV, {len(_bl_preds)} BL, {len(_rd_glen_preds)} RD-South-model, {len(_rd_south_measured)} RD-South-meas, {len(_rd_north_preds)} RD-North ({n_kept} kept/{_last_raw_count} raw)")
+                print('cached osv', len(_osv_preds), 'bl', len(_bl_preds),
+                      'model', len(_rd_glen_preds), 'meas', len(_rd_south_measured),
+                      'north', len(_rd_north_preds),
+                      'kept', n_kept, 'raw', _last_raw_count)
 
                 record_observation(front_t, _rd_south_measured)
 
@@ -937,14 +888,6 @@ class MetroApi:
 
         south_trains = [t for t in all_trains if t.get('southbound')]
         if not south_trains:
-            # The regression guard for the parse-time filter. A predicate bug
-            # produces a silently blank board, and rollback.py cannot catch
-            # that — it counts failed boots, not wrong output.
-            if is_transfer_intelligence_time():
-                _stage_note(('empty',),
-                            'xfer empty n_south=0 n_east=%d n_glen=%d n_meas=%d'
-                            % (len(mc_preds), len(_rd_glen_preds),
-                               len(_rd_south_measured)))
             return
 
         conns = []
@@ -969,8 +912,6 @@ class MetroApi:
                 t['skip_reason'] = "efficiency"
             else:
                 t['line_color'] = MetroApi._get_line_color(conn[0])
-
-        _observe_pairs(south_trains, conns, mc_preds, offset)
 
         skips = sum(1 for t in south_trains if t['skip_mode'])
         print(f"🧠 Transfer: {len(south_trains)} southbound, {len(mc_preds)} conn, {skips} skipped")

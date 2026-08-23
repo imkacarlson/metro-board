@@ -808,106 +808,22 @@ def test_a_station_code_disagreeing_with_config_disables_the_filter(_wire_api,
     # parse and the board would come up blank. Falling back to keep=None
     # degrades to today's behaviour instead.
     assert [t['destination'] for t in out] == ['Shady Gro']
-    assert '2 kept/2 raw' in capsys.readouterr().out
+    assert 'kept 2 raw 2' in capsys.readouterr().out
 
 
-def test_the_a07_diagnostic_still_sees_a_northbound_row(_wire_api, capsys):
+def test_a07_keeps_every_direction_through_the_parse(_wire_api):
+    """A07 rows are kept regardless of Group: direction is accept_southbound's
+    decision downstream, and the filter must never pre-empt it."""
     rows = [_train_json('A07', 'RD', 'Shady Grove', '3', '2'),
             _train_json('A07', 'RD', 'Glenmont', '4', '1')]
-    _wire_api(_wmata_body(rows))
-    MetroApi.fetch_train_predictions('A03')
-    out = capsys.readouterr().out
-    assert 'A07 g=2 d=Shady Grove m=3' in out
-    assert 'A07 g=1 d=Glenmont m=4' in out
+    body = _wmata_body(rows)
+    kept = direct_chunk_parse_trains(_FakeResponse(body), keep_transfer_row)
+    assert [r['Destination'] for r in kept] == ['Shady Grove', 'Glenmont']
 
-
-# --------------------------------------------------------------------------
-# The transfer-colour detector (staged in RAM; nothing goes near flash here)
-# --------------------------------------------------------------------------
-
-@pytest.fixture
-def _reset_note():
-    metro_api._note = None
-    metro_api._note_sig = None
-    metro_api._note_count = 0
-    yield
-    metro_api._note = None
-    metro_api._note_sig = None
-    metro_api._note_count = 0
-
-
-def test_dupline_pair_is_reported_with_both_connection_minutes(_reset_note):
-    # Two TAKE rows on the same line: eleven minutes apart, so the skip rule
-    # never fires and the board shows red-over-orange twice.
-    trains = _glenmont(8, 17)
-    MetroApi._apply_transfer_logic(trains, [('OR', 14), ('OR', 25)])
-    assert [t['skip_mode'] for t in trains] == [False, False]
-    assert metro_api._note == 'xfer dupline=OR t=8/17 conn=14/25 tol=2 n_east=2'
-
-
-def test_nodata_pair_is_reported(_reset_note):
-    trains = _glenmont(8, 13)
-    MetroApi._apply_transfer_logic(trains, [])
-    assert metro_api._note == 'xfer nodata t=8/13 eta=12/17 n_east=0'
-
-
-def test_empty_southbound_list_is_reported_during_the_window(_reset_note,
-                                                             monkeypatch):
-    monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: True)
-    MetroApi._apply_transfer_logic([], [('OR', 20)])
-    assert metro_api._note.startswith('xfer empty n_south=0 n_east=1')
-
-
-def test_empty_is_not_reported_outside_the_window(_reset_note, monkeypatch):
-    monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: False)
-    MetroApi._apply_transfer_logic([], [('OR', 20)])
-    assert metro_api._note is None
-
-
-def test_a_normal_board_stages_nothing(_reset_note):
-    trains = _glenmont(8, 17)
-    MetroApi._apply_transfer_logic(trains, [('OR', 14), ('BL', 25)])
-    assert metro_api._note is None
-
-
-def test_the_same_pair_across_refreshes_is_reported_once(_reset_note):
-    for arrive, conn in ((8, 14), (7, 13), (6, 12)):
-        metro_api._note = None
-        MetroApi._apply_transfer_logic(_glenmont(arrive, arrive + 9),
-                                       [('OR', conn), ('OR', conn + 11)])
-        first = arrive == 8
-        assert (metro_api._note is not None) is first
-
-
-def test_a_recurrence_after_a_clean_refresh_is_reported_again(_reset_note):
-    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('OR', 25)])
-    assert metro_api._note is not None
-
-    metro_api._note = None
-    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('BL', 25)])
-    assert metro_api._note is None, 'clean refresh clears the signature'
-
-    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('OR', 25)])
-    assert metro_api._note is not None
-
-
-def test_the_per_boot_cap_holds(_reset_note):
-    staged = 0
-    for i in range(metro_api.NOTE_MAX + 5):
-        metro_api._note = None
-        MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('BL', 25)])
-        MetroApi._apply_transfer_logic(_glenmont(8 + i, 13 + i), [])
-        if metro_api._note is not None:
-            staged += 1
-    assert staged == metro_api.NOTE_MAX
-
-
-def test_an_undrained_note_is_overwritten_not_queued(_reset_note):
-    MetroApi._apply_transfer_logic(_glenmont(8, 13), [])
-    first = metro_api._note
-    MetroApi._apply_transfer_logic(_glenmont(9, 15), [])
-    assert isinstance(metro_api._note, str)
-    assert metro_api._note != first
+    _wire_api(body)
+    out = MetroApi.fetch_train_predictions('A03')
+    # ...and only the southbound one reaches the display: 4 + 8 = 12.
+    assert [(t['destination'], t['arrival']) for t in out] == [('Glenmont', '12')]
 
 
 # --------------------------------------------------------------------------

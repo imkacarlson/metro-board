@@ -250,6 +250,30 @@ if _pending_failure is not None:
 up_button = _update_button()
 bootlog.append('code: button=%s, free=%d' % (up_button is not None, gc.mem_free()))
 
+# The update check happens HERE, before the first train fetch, and this position
+# is the whole point of it.
+#
+# One HTTPS fetch permanently claims ~54 KB: free goes 64 K -> 10 K across the
+# first refresh and never comes back, because the TLS session and socket buffers
+# stay allocated for the life of the run. A manifest fetch to a second host in
+# that regime costs another 1-3 KB, which drops the *next* train fetch under
+# optimized_fetch's 10000-byte floor. That floor reboots the board, which boots,
+# checks for updates again, and loops — 23 cycles of exactly that are in
+# /board.log.1. Up here there is 60+ KB free and the same fetch costs nothing
+# that matters.
+#
+# It runs before _mark_healthy(), so a handoff to ota.py leaves the boot counter
+# uncleared for one cycle. That is bounded: an install is one handoff plus one
+# reset, and the new build clears the counter on its own first refresh, well
+# short of rollback.MAX_FAILED_BOOTS.
+#
+# Guarded because it now runs outside the main loop's except: a failed update
+# check must never be the reason the board does not show trains.
+try:
+	check_for_update()
+except Exception as e:
+	bootlog.append('code: update check failed, carrying on: %s' % e)
+
 last_refresh = 0
 last_blink_update = 0
 button_was_down = False
@@ -264,33 +288,29 @@ while True:
 			train_board.refresh()
 			last_refresh = current_time
 
-			# Drain whatever metro_api staged about the board that just went out.
-			# Here, not in the fetch path: refresh() has returned, so the big
-			# lists are freed and flash is safe to touch.
-			if metro_api._note is not None:
-				bootlog.append(metro_api._note)
-				metro_api._note = None
-
 			if not _marked_healthy:
-				# Order matters: prove this build works and clear the rollback
-				# counter *before* an update can send us round again, otherwise
-				# a run of successful updates would look like a run of failures.
 				bootlog.append('code: first refresh ok, free=%d' % gc.mem_free())
 				_mark_healthy()
-				check_for_update()
 
 		# Update blinks at consistent intervals for smooth animation
 		if current_time - last_blink_update >= BLINK_UPDATE_INTERVAL:
 			train_board.update_blink()
 			last_blink_update = current_time
 
-		# On demand via the UP button, otherwise once a day.
+		# On demand via the UP button, otherwise once a day. The daily path
+		# reboots instead of checking in place: by now the first fetch has taken
+		# its ~54 KB and a manifest fetch here is what started the reboot loop.
+		# A reboot lands in the high-memory regime where the check belongs, and
+		# never during the morning window.
 		button_down = up_button is not None and not up_button.value
 		if button_down and not button_was_down:
 			print('UP button pressed — checking for an update')
 			check_for_update(force=True)
-		elif _marked_healthy and current_time - _last_update_check >= UPDATE_CHECK_INTERVAL:
-			check_for_update()
+		elif (_marked_healthy
+				and current_time - _last_update_check >= UPDATE_CHECK_INTERVAL
+				and not metro_api.is_transfer_intelligence_time()):
+			print('Daily update check — rebooting into it')
+			supervisor.reload()
 		button_was_down = button_down
 
 		time.sleep(0.01)  # Smaller sleep for more responsive timing
