@@ -908,3 +908,43 @@ def test_an_undrained_note_is_overwritten_not_queued(_reset_note):
     MetroApi._apply_transfer_logic(_glenmont(9, 15), [])
     assert isinstance(metro_api._note, str)
     assert metro_api._note != first
+
+
+# --------------------------------------------------------------------------
+# Missing fields must not invent trains
+# --------------------------------------------------------------------------
+
+# A real WMATA row with no estimate: Min is unquoted null, so extract_field's
+# '"Min":"' prefix does not match and it returns None.
+NULL_MIN_ROW = ('{"Car":"8","Destination":"Glenmont","DestinationCode":"B11",'
+                '"DestinationName":"Glenmont","Group":"1","Line":"RD",'
+                '"LocationCode":"A03","LocationName":"Dupont Circle","Min":null}')
+
+NO_GROUP_ROW = ('{"Destination":"Glenmont","Line":"RD","LocationCode":"A03",'
+                '"Min":"9"}')
+
+
+def test_a_null_min_carries_no_time_instead_of_arriving_now():
+    parsed = parse_train_fragment(NULL_MIN_ROW)
+    assert parsed['Min'] == '---'
+    assert MetroApi._parse_min(parsed['Min']) is None
+
+
+def test_a_missing_group_matches_neither_direction():
+    parsed = parse_train_fragment(NO_GROUP_ROW)
+    assert parsed['Group'] == '0'
+    assert parsed['Group'] not in (metro_api.NORTHBOUND_GROUP,
+                                   metro_api.SOUTHBOUND_GROUP)
+    assert accept_southbound(parsed['Group'], 'Glenmont') is False
+
+
+def test_a_row_with_no_group_does_not_silently_become_southbound(_wire_api):
+    """It used to: a Dupont row with no Group defaulted to southbound and
+    overwrote the modelled minute with a measurement of a train that may not
+    even be going that way."""
+    rows = [_train_json('A07', 'RD', 'Glenmont', '4', '1', loc_name='Tenleytown'),
+            NO_GROUP_ROW]
+    _wire_api(_wmata_body(rows))
+    out = MetroApi.fetch_train_predictions('A03')
+    # Tenleytown 4 + 8 = 12, modelled. The Group-less 9 is not a measurement.
+    assert [(t['destination'], t['arrival']) for t in out] == [('Glenmont', '12')]

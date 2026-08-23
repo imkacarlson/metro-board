@@ -548,8 +548,13 @@ def parse_train_fragment(train_json, keep=None):
             return {
                 'Line': line,
                 'Destination': dest, 
-                'Min': mins or '0',
-                'Group': group or '1',
+                # WMATA emits unquoted "Min":null, for which extract_field
+                # returns None. Defaulting that to '0' invented a train
+                # arriving now; '---' maps to None in _parse_min, which is the
+                # honest answer. Likewise a missing Group used to default to
+                # southbound: '0' matches neither direction constant.
+                'Min': mins or '---',
+                'Group': group or '0',
                 'LocationCode': location
             }
     except:
