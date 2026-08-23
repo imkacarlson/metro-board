@@ -19,6 +19,7 @@ from config import config
 bootlog.defer('code: config ok, free=%d' % gc.mem_free())
 from train_board import TrainBoard
 bootlog.defer('code: train_board ok, free=%d' % gc.mem_free())
+import metro_api
 from metro_api import MetroApi, MetroApiOnFireException
 bootlog.defer('code: metro_api ok, free=%d' % gc.mem_free())
 
@@ -68,10 +69,23 @@ def _remote_version():
 	return version
 
 
-def check_for_update():
+def check_for_update(force=False):
 	"""Compare the published version against ours; hand off to ota.py if they differ."""
 	global _last_update_check
 	_last_update_check = time.monotonic()
+
+	if not force and metro_api.is_transfer_intelligence_time():
+		# _remote_version() does a full HTTP manifest fetch, and this runs once
+		# per boot right after the first refresh — the tightest-memory moment of
+		# the cycle, during the only window that fetches four stations at once.
+		# /version.txt already matches on nearly every boot, so it fragments for
+		# nothing. Costs an overnight update installing after 08:30, not 06:45.
+		print('OTA: transfer window — deferring the update check')
+		# After the assignment above, not instead of it: leaving _last_update_check
+		# alone would make the main loop's >= UPDATE_CHECK_INTERVAL branch spin
+		# every 10 ms. Same backoff idiom as update_system_time.
+		_last_update_check = time.monotonic() - UPDATE_CHECK_INTERVAL + (15 * 60)
+		return
 
 	if supervisor.runtime.usb_connected:
 		# Tethered: boot.py left the filesystem read-only, so ota.py could not
@@ -250,6 +264,13 @@ while True:
 			train_board.refresh()
 			last_refresh = current_time
 
+			# Drain whatever metro_api staged about the board that just went out.
+			# Here, not in the fetch path: refresh() has returned, so the big
+			# lists are freed and flash is safe to touch.
+			if metro_api._note is not None:
+				bootlog.append(metro_api._note)
+				metro_api._note = None
+
 			if not _marked_healthy:
 				# Order matters: prove this build works and clear the rollback
 				# counter *before* an update can send us round again, otherwise
@@ -267,7 +288,7 @@ while True:
 		button_down = up_button is not None and not up_button.value
 		if button_down and not button_was_down:
 			print('UP button pressed — checking for an update')
-			check_for_update()
+			check_for_update(force=True)
 		elif _marked_healthy and current_time - _last_update_check >= UPDATE_CHECK_INTERVAL:
 			check_for_update()
 		button_was_down = button_down

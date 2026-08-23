@@ -427,7 +427,8 @@ def _fake_api(monkeypatch):
     def install(rows):
         monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: True)
         monkeypatch.setattr(metro_api, '_init_network', lambda: None)
-        monkeypatch.setattr(metro_api, 'optimized_fetch', lambda path: list(rows))
+        monkeypatch.setattr(metro_api, 'optimized_fetch',
+                            lambda path, keep=None: list(rows))
         monkeypatch.setattr(metro_api, 'log_memory', lambda label: 20000)
         metro_api._prev_front_t = None
         metro_api._obs.clear()
@@ -480,3 +481,470 @@ def test_full_fetch_records_one_observation_when_the_front_train_crosses(_fake_a
     for _ in range(12):  # a minute of 5-second refreshes on the same train
         MetroApi.fetch_train_predictions('A03')
     assert metro_api._obs == [8]
+
+
+# --------------------------------------------------------------------------
+# The wire parser: optimized_fetch → direct_chunk_parse_trains →
+# parse_train_fragment → extract_field
+#
+# These are characterization tests first: every one of them is written against
+# keep=None, so they pass identically before and after the parse-time filter
+# exists. That is what makes the equivalence group below mean something.
+# --------------------------------------------------------------------------
+
+import gc as _gc
+
+from metro_api import (direct_chunk_parse_trains, extract_field,
+                       keep_simple_row, keep_transfer_row,
+                       parse_train_fragment)
+
+
+def _train_json(loc, line, dest, mins, group, car='8', dest_code='B11',
+                loc_name='Dupont Circle'):
+    """A *full* WMATA train object, in WMATA's real key order.
+
+    The parser is a substring scanner, so a five-key fixture would not exercise
+    what can actually break: DestinationCode/DestinationName sit right next to
+    Destination, and LocationName right next to LocationCode.
+    """
+    return (
+        '{"Car":"%s","Destination":"%s","DestinationCode":"%s",'
+        '"DestinationName":"%s","Group":"%s","Line":"%s","LocationCode":"%s",'
+        '"LocationName":"%s","Min":"%s"}'
+        % (car, dest, dest_code, dest, group, line, loc, loc_name, mins)
+    )
+
+
+def _wmata_body(rows):
+    return '{"Trains":[' + ','.join(rows) + ']}'
+
+
+class _FakeResponse:
+    """Feeds a body through iter_content() in fixed-size chunks."""
+
+    def __init__(self, body, chunk_size=256, encode=True):
+        self._data = body.encode('utf-8') if encode else body
+        self._chunk_size = chunk_size
+        self.closed = False
+
+    def iter_content(self, _n=256):
+        step = self._chunk_size
+        for i in range(0, len(self._data), step):
+            yield self._data[i:i + step]
+
+    def close(self):
+        self.closed = True
+
+
+ALL_CHUNK_SIZES = [1, 2, 3, 7, 16, 64, 256, 4096]
+
+# A realistic four-station body: two eastbound sources, Tenleytown, Dupont.
+FOUR_STATION_ROWS = [
+    _train_json('K02', 'OR', 'New Carrollton', '2', '1', loc_name='Clarendon'),
+    _train_json('K02', 'SV', 'Largo', '6', '1', loc_name='Clarendon'),
+    _train_json('K02', 'OR', 'Vienna', '4', '2', loc_name='Clarendon'),
+    _train_json('K02', 'SV', 'No Passenger', '3', '2', loc_name='Clarendon'),
+    _train_json('C07', 'BL', 'Largo', '5', '1', loc_name='Pentagon'),
+    _train_json('C07', 'YL', 'Greenbelt', '3', '1', loc_name='Pentagon'),
+    _train_json('C07', 'BL', 'Franconia', '8', '2', loc_name='Pentagon'),
+    _train_json('A07', 'RD', 'Glenmont', '4', '1', loc_name='Tenleytown'),
+    _train_json('A07', 'RD', 'Silver Spring', '9', '1', loc_name='Tenleytown'),
+    _train_json('A07', 'RD', 'Shady Grove', '3', '2', loc_name='Tenleytown'),
+    _train_json('A07', 'RD', 'Farragut North', '6', '1', loc_name='Tenleytown'),
+    _train_json('A03', 'RD', 'Glenmont', '12', '1'),
+    _train_json('A03', 'RD', 'Shady Grove', '9', '2'),
+    _train_json('A03', 'RD', 'No Passenger', '2', '2'),
+]
+
+
+def _legacy_relevant(row):
+    """An independent transcription of the elif chain in
+    fetch_train_predictions — deliberately *not* sharing code with
+    keep_transfer_row, so predicate/branch drift shows up as a failure.
+
+    Route identity only, matching the chain's station/line/destination
+    conditions; time and direction are the chain's business, not the filter's.
+    """
+    loc, line, dest = row['LocationCode'], row['Line'], row['Destination']
+    east = ('New Carrollton', 'N Carrollton', 'NewCrlton', 'Largo')
+    if loc == 'K02':
+        return line in ('OR', 'SV') and dest in east
+    if loc == 'C07':
+        return line == 'BL' and dest in east
+    if loc == 'A07':
+        return line == 'RD'
+    if loc == 'A03':
+        return line == 'RD'
+    return False
+
+
+# --- extraction ------------------------------------------------------------
+
+def test_extract_field_is_not_confused_by_neighbouring_keys():
+    frag = _train_json('A03', 'RD', 'Glenmont', '5', '1')
+    assert extract_field(frag, '"Destination":"') == 'Glenmont'
+    assert extract_field(frag, '"LocationCode":"') == 'A03'
+    assert extract_field(frag, '"Line":"') == 'RD'
+    assert extract_field(frag, '"Min":"') == '5'
+    assert extract_field(frag, '"Group":"') == '1'
+
+
+def test_extract_field_missing_key_is_none():
+    assert extract_field('{"Line":"RD"}', '"Nope":"') is None
+
+
+def test_parse_single_station_body():
+    body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', '5', '1'),
+                        _train_json('A03', 'RD', 'Shady Grove', 'BRD', '2')])
+    trains = direct_chunk_parse_trains(_FakeResponse(body))
+    assert trains == [
+        {'Line': 'RD', 'Destination': 'Glenmont', 'Min': '5', 'Group': '1',
+         'LocationCode': 'A03'},
+        {'Line': 'RD', 'Destination': 'Shady Grove', 'Min': 'BRD', 'Group': '2',
+         'LocationCode': 'A03'},
+    ]
+
+
+@pytest.mark.parametrize('chunk_size', ALL_CHUNK_SIZES)
+def test_output_is_identical_at_every_chunk_size(chunk_size):
+    """Subsumes every hand-picked split: inside "Trains":[, inside a field
+    value, mid-object, mid-key. One byte at a time is the hardest case."""
+    body = _wmata_body(FOUR_STATION_ROWS)
+    reference = direct_chunk_parse_trains(_FakeResponse(body, 4096))
+    assert direct_chunk_parse_trains(_FakeResponse(body, chunk_size)) == reference
+    assert len(reference) == len(FOUR_STATION_ROWS)
+
+
+def test_split_inside_the_trains_marker():
+    body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', '5', '1')])
+    cut = body.index('"Trains":[') + 4
+    chunks = [body[:cut].encode(), body[cut:].encode()]
+
+    class _R:
+        def iter_content(self, _n=256):
+            return iter(chunks)
+
+    assert direct_chunk_parse_trains(_R())[0]['Destination'] == 'Glenmont'
+
+
+def test_split_inside_a_field_value():
+    body = _wmata_body([_train_json('A03', 'RD', 'Silver Spring', '5', '1')])
+    cut = body.index('Silver Spring') + 6
+    chunks = [body[:cut].encode(), body[cut:].encode()]
+
+    class _R:
+        def iter_content(self, _n=256):
+            return iter(chunks)
+
+    assert direct_chunk_parse_trains(_R())[0]['Destination'] == 'Silver Spring'
+
+
+@pytest.mark.parametrize('raw', ['BRD', 'ARR', '---', '4'])
+def test_min_survives_the_parser_verbatim(raw):
+    """The parser must not interpret Min — that is _parse_min's job, later."""
+    body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', raw, '1')])
+    assert direct_chunk_parse_trains(_FakeResponse(body))[0]['Min'] == raw
+
+
+def test_empty_trains_array():
+    assert direct_chunk_parse_trains(_FakeResponse('{"Trains":[]}')) == []
+
+
+def test_body_with_no_trains_key():
+    assert direct_chunk_parse_trains(_FakeResponse('{"Error":"nope"}')) == []
+
+
+def test_stream_ending_mid_object_drops_the_partial_row():
+    body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', '5', '1'),
+                        _train_json('A03', 'RD', 'Shady Grove', '9', '2')])
+    truncated = body[:len(body) - 30]
+    trains = direct_chunk_parse_trains(_FakeResponse(truncated))
+    assert [t['Destination'] for t in trains] == ['Glenmont']
+
+
+def test_undecodable_bytes_do_not_kill_the_parse():
+    body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', '5', '1')])
+    raw = body.encode('utf-8').replace(b'Glenmont', b'Glen\xffont')
+    trains = direct_chunk_parse_trains(_FakeResponse(raw, 4096, encode=False))
+    assert len(trains) == 1
+    assert trains[0]['LocationCode'] == 'A03'
+
+
+def test_raw_count_cap_bounds_the_loop():
+    """The runaway guard has to count rows *seen*: with a filter in place a
+    retained-only cap would leave the loop unbounded over the stream."""
+    rows = [_train_json('A03', 'RD', 'Glenmont', '5', '1')] * (metro_api.RAW_MAX + 40)
+    trains = direct_chunk_parse_trains(_FakeResponse(_wmata_body(rows)),
+                                       lambda loc, line, dest: False)
+    assert trains == []
+    assert metro_api._last_raw_count == metro_api.RAW_MAX
+
+
+def test_retained_count_cap_bounds_the_list():
+    rows = [_train_json('A03', 'RD', 'Glenmont', '5', '1')] * (metro_api.KEEP_MAX + 10)
+    trains = direct_chunk_parse_trains(_FakeResponse(_wmata_body(rows)))
+    assert len(trains) == metro_api.KEEP_MAX
+
+
+def test_a_malformed_fragment_is_dropped_before_keep_is_consulted():
+    """Today's semantics: a row missing Line/Destination/LocationCode never
+    reaches the predicate, so a predicate cannot resurrect it."""
+    calls = []
+
+    def spy(loc, line, dest):
+        calls.append((loc, line, dest))
+        return True
+
+    assert parse_train_fragment('{"Line":"RD","Min":"5"}', spy) is None
+    assert calls == []
+
+
+# --- filter equivalence ----------------------------------------------------
+
+def test_filtering_during_the_parse_matches_filtering_afterwards():
+    """The invariant the whole change rests on: the predicate is a strict
+    over-approximation of what the downstream elif chain keeps."""
+    body = _wmata_body(FOUR_STATION_ROWS)
+    unfiltered = direct_chunk_parse_trains(_FakeResponse(body))
+    filtered = direct_chunk_parse_trains(_FakeResponse(body), keep_transfer_row)
+    assert [r for r in unfiltered if _legacy_relevant(r)] == filtered
+
+
+@pytest.mark.parametrize('chunk_size', ALL_CHUNK_SIZES)
+def test_equivalence_holds_at_every_chunk_size(chunk_size):
+    body = _wmata_body(FOUR_STATION_ROWS)
+    unfiltered = direct_chunk_parse_trains(_FakeResponse(body, chunk_size))
+    filtered = direct_chunk_parse_trains(_FakeResponse(body, chunk_size),
+                                         keep_transfer_row)
+    assert [r for r in unfiltered if _legacy_relevant(r)] == filtered
+
+
+def test_the_filter_materially_shrinks_retention():
+    body = _wmata_body(FOUR_STATION_ROWS)
+    unfiltered = direct_chunk_parse_trains(_FakeResponse(body))
+    filtered = direct_chunk_parse_trains(_FakeResponse(body), keep_transfer_row)
+    assert len(filtered) < len(unfiltered)
+
+
+@pytest.mark.parametrize('loc, line, dest, kept', [
+    ('K02', 'OR', 'New Carrollton', True),
+    ('K02', 'SV', 'Largo', True),
+    ('K02', 'OR', 'Vienna', False),          # westbound
+    ('K02', 'BL', 'Largo', False),           # wrong line for this station
+    ('C07', 'BL', 'NewCrlton', True),
+    ('C07', 'YL', 'Greenbelt', False),
+    ('C07', 'BL', 'Franconia', False),
+    ('A07', 'RD', 'Glenmont', True),
+    ('A07', 'RD', 'Shady Grove', True),      # northbound: the A07 g= diagnostic
+    ('A07', 'OR', 'Vienna', False),
+    ('A03', 'RD', 'Glenmont', True),
+    ('A03', 'RD', 'Shady Grove', True),      # both Groups
+    ('A03', 'BL', 'Largo', False),
+    ('B35', 'RD', 'Glenmont', False),        # a station we never asked for
+])
+def test_keep_transfer_row_accept_reject_table(loc, line, dest, kept):
+    assert keep_transfer_row(loc, line, dest) is kept
+
+
+@pytest.mark.parametrize('dest, kept', [
+    ('Glenmont', True), ('Shady Grove', True),
+    ('No Passenger', False), ('NoPssenger', False),
+    ('ssenger', False), ('No Psngr', False),
+])
+def test_keep_simple_row_drops_only_non_passenger(dest, kept):
+    assert keep_simple_row('A03', 'RD', dest) is kept
+
+
+# --- end to end, over the wire --------------------------------------------
+
+@pytest.fixture
+def _wire_api(monkeypatch):
+    """Run fetch_train_predictions against a real wire body: no shortcut past
+    optimized_fetch, so the parse path under test is the one that runs."""
+    def install(body, chunk_size=64):
+        monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: True)
+        monkeypatch.setattr(metro_api, '_init_network', lambda: None)
+        monkeypatch.setattr(metro_api, 'log_memory', lambda label: 20000)
+        monkeypatch.setattr(_gc, 'mem_free', lambda: 100000, raising=False)
+        monkeypatch.setattr(_gc, 'mem_alloc', lambda: 10000, raising=False)
+
+        class _Net:
+            def fetch(self, url, headers=None):
+                return _FakeResponse(body, chunk_size)
+
+        monkeypatch.setattr(metro_api, '_network', _Net())
+        metro_api._prev_front_t = None
+        metro_api._obs.clear()
+    yield install
+    metro_api._prev_front_t = None
+    metro_api._obs.clear()
+    metro_api._network = None
+
+
+def test_end_to_end_display_is_byte_identical_with_and_without_the_filter(
+        _wire_api, monkeypatch):
+    body = _wmata_body(FOUR_STATION_ROWS)
+    _wire_api(body)
+
+    monkeypatch.setattr(metro_api, 'keep_transfer_row', None)
+    unfiltered = MetroApi.fetch_train_predictions('A03')
+    monkeypatch.undo()
+
+    _wire_api(body)
+    filtered = MetroApi.fetch_train_predictions('A03')
+    assert filtered == unfiltered
+    assert filtered, 'the fixture should produce a non-empty board'
+
+
+def test_a_station_code_disagreeing_with_config_disables_the_filter(_wire_api,
+                                                                    capsys):
+    """Safety valve: a caller passing a station config does not know about
+    would otherwise have every one of its rows rejected and blank the board."""
+    rows = [_train_json('B35', 'RD', 'Glenmont', '12', '1'),
+            _train_json('B35', 'RD', 'Shady Grove', '9', '2')]
+    _wire_api(_wmata_body(rows))
+    out = MetroApi.fetch_train_predictions('B35')
+    # With the filter wrongly enabled every B35 row would be rejected during the
+    # parse and the board would come up blank. Falling back to keep=None
+    # degrades to today's behaviour instead.
+    assert [t['destination'] for t in out] == ['Shady Gro']
+    assert '2 kept/2 raw' in capsys.readouterr().out
+
+
+def test_the_a07_diagnostic_still_sees_a_northbound_row(_wire_api, capsys):
+    rows = [_train_json('A07', 'RD', 'Shady Grove', '3', '2'),
+            _train_json('A07', 'RD', 'Glenmont', '4', '1')]
+    _wire_api(_wmata_body(rows))
+    MetroApi.fetch_train_predictions('A03')
+    out = capsys.readouterr().out
+    assert 'A07 g=2 d=Shady Grove m=3' in out
+    assert 'A07 g=1 d=Glenmont m=4' in out
+
+
+# --------------------------------------------------------------------------
+# The transfer-colour detector (staged in RAM; nothing goes near flash here)
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def _reset_note():
+    metro_api._note = None
+    metro_api._note_sig = None
+    metro_api._note_count = 0
+    yield
+    metro_api._note = None
+    metro_api._note_sig = None
+    metro_api._note_count = 0
+
+
+def test_dupline_pair_is_reported_with_both_connection_minutes(_reset_note):
+    # Two TAKE rows on the same line: eleven minutes apart, so the skip rule
+    # never fires and the board shows red-over-orange twice.
+    trains = _glenmont(8, 17)
+    MetroApi._apply_transfer_logic(trains, [('OR', 14), ('OR', 25)])
+    assert [t['skip_mode'] for t in trains] == [False, False]
+    assert metro_api._note == 'xfer dupline=OR t=8/17 conn=14/25 tol=2 n_east=2'
+
+
+def test_nodata_pair_is_reported(_reset_note):
+    trains = _glenmont(8, 13)
+    MetroApi._apply_transfer_logic(trains, [])
+    assert metro_api._note == 'xfer nodata t=8/13 eta=12/17 n_east=0'
+
+
+def test_empty_southbound_list_is_reported_during_the_window(_reset_note,
+                                                             monkeypatch):
+    monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: True)
+    MetroApi._apply_transfer_logic([], [('OR', 20)])
+    assert metro_api._note.startswith('xfer empty n_south=0 n_east=1')
+
+
+def test_empty_is_not_reported_outside_the_window(_reset_note, monkeypatch):
+    monkeypatch.setattr(metro_api, 'is_transfer_intelligence_time', lambda: False)
+    MetroApi._apply_transfer_logic([], [('OR', 20)])
+    assert metro_api._note is None
+
+
+def test_a_normal_board_stages_nothing(_reset_note):
+    trains = _glenmont(8, 17)
+    MetroApi._apply_transfer_logic(trains, [('OR', 14), ('BL', 25)])
+    assert metro_api._note is None
+
+
+def test_the_same_pair_across_refreshes_is_reported_once(_reset_note):
+    for arrive, conn in ((8, 14), (7, 13), (6, 12)):
+        metro_api._note = None
+        MetroApi._apply_transfer_logic(_glenmont(arrive, arrive + 9),
+                                       [('OR', conn), ('OR', conn + 11)])
+        first = arrive == 8
+        assert (metro_api._note is not None) is first
+
+
+def test_a_recurrence_after_a_clean_refresh_is_reported_again(_reset_note):
+    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('OR', 25)])
+    assert metro_api._note is not None
+
+    metro_api._note = None
+    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('BL', 25)])
+    assert metro_api._note is None, 'clean refresh clears the signature'
+
+    MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('OR', 25)])
+    assert metro_api._note is not None
+
+
+def test_the_per_boot_cap_holds(_reset_note):
+    staged = 0
+    for i in range(metro_api.NOTE_MAX + 5):
+        metro_api._note = None
+        MetroApi._apply_transfer_logic(_glenmont(8, 17), [('OR', 14), ('BL', 25)])
+        MetroApi._apply_transfer_logic(_glenmont(8 + i, 13 + i), [])
+        if metro_api._note is not None:
+            staged += 1
+    assert staged == metro_api.NOTE_MAX
+
+
+def test_an_undrained_note_is_overwritten_not_queued(_reset_note):
+    MetroApi._apply_transfer_logic(_glenmont(8, 13), [])
+    first = metro_api._note
+    MetroApi._apply_transfer_logic(_glenmont(9, 15), [])
+    assert isinstance(metro_api._note, str)
+    assert metro_api._note != first
+
+
+# --------------------------------------------------------------------------
+# Missing fields must not invent trains
+# --------------------------------------------------------------------------
+
+# A real WMATA row with no estimate: Min is unquoted null, so extract_field's
+# '"Min":"' prefix does not match and it returns None.
+NULL_MIN_ROW = ('{"Car":"8","Destination":"Glenmont","DestinationCode":"B11",'
+                '"DestinationName":"Glenmont","Group":"1","Line":"RD",'
+                '"LocationCode":"A03","LocationName":"Dupont Circle","Min":null}')
+
+NO_GROUP_ROW = ('{"Destination":"Glenmont","Line":"RD","LocationCode":"A03",'
+                '"Min":"9"}')
+
+
+def test_a_null_min_carries_no_time_instead_of_arriving_now():
+    parsed = parse_train_fragment(NULL_MIN_ROW)
+    assert parsed['Min'] == '---'
+    assert MetroApi._parse_min(parsed['Min']) is None
+
+
+def test_a_missing_group_matches_neither_direction():
+    parsed = parse_train_fragment(NO_GROUP_ROW)
+    assert parsed['Group'] == '0'
+    assert parsed['Group'] not in (metro_api.NORTHBOUND_GROUP,
+                                   metro_api.SOUTHBOUND_GROUP)
+    assert accept_southbound(parsed['Group'], 'Glenmont') is False
+
+
+def test_a_row_with_no_group_does_not_silently_become_southbound(_wire_api):
+    """It used to: a Dupont row with no Group defaulted to southbound and
+    overwrote the modelled minute with a measurement of a train that may not
+    even be going that way."""
+    rows = [_train_json('A07', 'RD', 'Glenmont', '4', '1', loc_name='Tenleytown'),
+            NO_GROUP_ROW]
+    _wire_api(_wmata_body(rows))
+    out = MetroApi.fetch_train_predictions('A03')
+    # Tenleytown 4 + 8 = 12, modelled. The Group-less 9 is not a measurement.
+    assert [(t['destination'], t['arrival']) for t in out] == [('Glenmont', '12')]
