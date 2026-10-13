@@ -62,6 +62,12 @@ config = {
 	'osv_pred_source' : ('K02', 12),   # Clarendon → MC ≈ 12 min
 	'bl_pred_source'  : ('C07', 13),   # Pentagon  → MC ≈ 13 min
 
+	# Metro Center's own lower-level board (OR/SV/BL). Clarendon and Pentagon
+	# cannot see a train that has already passed them, so on their own they
+	# miss every connection arriving in the next ~12 minutes — exactly the one
+	# the front southbound train catches. Measured here, it fills that gap.
+	'mc_east_station' : 'C01',
+
 	# Upstream predictor for southbound Red‑line trains.
 	# Northbound is read straight off Dupont's own predictions (Group 2) —
 	# see metro_api.NORTHBOUND_GROUP — so it needs no upstream source and
@@ -72,7 +78,8 @@ config = {
 	'rd_glen_pred_source' : ('A07', 8),   # Tenleytown → Dupont ≈ +8 min
 
 	# Never show a train you cannot physically reach: door → Dupont platform.
-	'display_floor_min'   : 7,
+	# Was 7 until Oct 2026.
+	'display_floor_min'   : 6,
 
 	# Keith's morning‑commute parameters
 	'ride_dupont_to_mc'   : 3,   # min on the Red line
@@ -87,6 +94,10 @@ config = {
 	# How far apart (min) a modelled Tenleytown arrival and a measured Dupont
 	# arrival can be and still be believed to be the same train.
 	'dupont_match_window' : 3,
+
+	# Same idea for eastbound: how far apart an upstream-modelled Metro Center
+	# arrival and Metro Center's own figure can be and still be one train.
+	'east_match_window'   : 3,
 
 	# Transfer intelligence time window (weekday mornings only)
 	'transfer_start_hour'   : 6,   # Transfer intelligence starts at 6:45 AM
