@@ -15,6 +15,7 @@ WALK_TRANSFER = config['walk_transfer']
 RIDE_DUPONT_TO_MC = config['ride_dupont_to_mc']
 SKIP_TOLERANCE = config['skip_tolerance']
 DUPONT_MATCH_WINDOW = config['dupont_match_window']
+EAST_MATCH_WINDOW = config['east_match_window']
 LOADING_MIN_TEXT = config['loading_min_text']
 NUM_TRAINS = config['num_trains']
 TRANSFER_START_HOUR = config['transfer_start_hour']
@@ -26,6 +27,7 @@ MAIN_STATION = config['metro_station_code']
 OSV_STATION = OSV_PRED_SOURCE[0]
 BL_STATION = BL_PRED_SOURCE[0]
 RD_GLEN_STATION = RD_GLEN_PRED_SOURCE[0]
+MC_EAST_STATION = config['mc_east_station']
 
 # Delete config dict after extracting constants
 del config
@@ -190,8 +192,9 @@ def optimized_fetch(api_path, keep=None):
 _osv_preds = []   # Clarendon / Courthouse  OR/SV
 _bl_preds  = []   # Pentagon / Arlington   BL
 _rd_glen_preds = []   # (destination, arrival mins) @Dupont southbound, modelled from Tenleytown
-_rd_south_measured = []  # arrival mins @Dupont southbound, off Dupont's own board
+_rd_south_measured = []  # (destination, arrival mins) @Dupont southbound, off Dupont's own board
 _rd_north_preds = []  # (destination, arrival mins) @Dupont for northbound trains
+_mc_measured = []     # (line, arrival mins) eastbound, off Metro Center's own board
 
 # Live measurement of the Tenleytown → Dupont travel time. Every refresh holds
 # a modelled and a measured figure for the same train; their difference is the
@@ -257,7 +260,19 @@ NON_PASSENGER = (DEST_NO_PASSENGER, DEST_NOPSSENGER, DEST_SSENGER, DEST_NO_PSNGR
 # Eastbound out of Metro Center: the connection we are trying to catch. One
 # spelling of this set, shared by the parse-time filter and the branches it
 # mirrors, so the two cannot drift apart.
-EAST_DESTS = (DEST_NEW_CARROLLTON, DEST_N_CARROLLTON, DEST_NEWCRLTON, DEST_LARGO)
+#
+# Substrings, not exact names, for the same reason as NOT_VIA_METRO_CENTER:
+# Largo was renamed Downtown Largo, and an exact 'Largo' match would silently
+# drop every Blue and Silver connection the day the sign text follows suit —
+# the skip logic would then run on Orange alone and still look plausible.
+EAST_DESTS = ('arroll', 'Crlton', 'argo')
+
+# True if this destination is an eastbound connection out of Metro Center.
+def is_east_dest(dest):
+    for frag in EAST_DESTS:
+        if frag in dest:
+            return True
+    return False
 
 # Southbound destinations that never reach Metro Center, as substrings.
 # Substrings because WMATA abbreviates unpredictably — see the four spellings
@@ -373,26 +388,31 @@ _last_raw_count = 0  # rows seen by the last parse, for the ✅ Cached: line
 
 
 def direct_chunk_parse_trains(response, keep=None):
-    """Revolutionary zero-string-assembly parser that processes HTTP chunks directly"""
+    """Stream the Trains array out of HTTP chunks, one object at a time.
+
+    Each object is located with str.find and cut out with a single slice. The
+    old loop grew it with `current_train += char`, which is one fresh string
+    per byte: ~250 allocations of rising size per row, over up to RAW_MAX rows,
+    every refresh — about the worst thing you can do to a heap whose failure
+    mode is fragmentation.
+
+    Rows come back as tuples; see parse_train_fragment.
+    """
     import gc
     global _last_raw_count
     trains = []
-    
-    # State machine for incremental JSON parsing
-    buffer = ""  # Small rolling buffer for incomplete JSON fragments
+
+    buffer = ""
     raw_count = 0
     chunks = 0
     _last_raw_count = 0
     in_trains_array = False
-    brace_depth = 0
-    current_train = ""
-    
+
     try:
-        for chunk in response.iter_content(256):  # Smaller chunks for better memory control
+        for chunk in response.iter_content(256):
             if not chunk:
                 continue
-                
-            # Decode chunk and add to rolling buffer  
+
             if isinstance(chunk, bytes):
                 try:
                     chunk_text = chunk.decode('utf-8')
@@ -401,113 +421,104 @@ def direct_chunk_parse_trains(response, keep=None):
             else:
                 chunk_text = str(chunk)
             buffer += chunk_text
-            
-            # Process complete train objects from buffer
+            del chunk_text
+
             while True:
                 if not in_trains_array:
-                    # Look for start of Trains array
                     trains_pos = buffer.find('"Trains":[')
-                    if trains_pos != -1:
-                        in_trains_array = True
-                        buffer = buffer[trains_pos + 10:]  # Skip past "Trains":[
-                        continue
-                    else:
-                        # Keep only last 50 chars to catch split patterns
+                    if trains_pos == -1:
+                        # Keep only enough tail to catch a split marker
                         if len(buffer) > 50:
                             buffer = buffer[-50:]
                         break
-                
-                # We're in trains array, look for complete train objects
-                if not current_train:
-                    # Look for start of train object
-                    brace_start = buffer.find('{')
-                    if brace_start == -1:
-                        # Keep buffer small while waiting for next object
-                        if len(buffer) > 20:
-                            buffer = buffer[-20:]
-                        break
-                    buffer = buffer[brace_start:]
-                    current_train = ""
-                    brace_depth = 0
-                
-                # Build current train object character by character
-                i = 0
-                while i < len(buffer):
-                    char = buffer[i]
-                    current_train += char
-                    
-                    if char == '{':
-                        brace_depth += 1
-                    elif char == '}':
-                        brace_depth -= 1
-                        if brace_depth == 0:
-                            # Complete train object found - parse it immediately
-                            train_data = parse_train_fragment(current_train, keep)
-                            raw_count += 1
-                            _last_raw_count = raw_count
-                            if train_data:
-                                trains.append(train_data)
-                                if len(trains) >= KEEP_MAX:
-                                    return trains
-                            if raw_count >= RAW_MAX:  # Prevent runaway parsing
-                                return trains
-                            
-                            # Reset for next train
-                            current_train = ""
-                            buffer = buffer[i+1:]  # Remove processed portion
-                            break
-                    
-                    i += 1
-                else:
-                    # Incomplete train object, buffer is consumed
-                    buffer = ""
+                    in_trains_array = True
+                    buffer = buffer[trains_pos + 10:]
+                    continue
+
+                start = buffer.find('{')
+                if start == -1:
+                    buffer = ""  # nothing here can begin an object
                     break
-            
-            # Memory management - force garbage collection every few chunks.
+
+                # Find the matching close brace. WMATA train objects are flat,
+                # but depth is still tracked so a nested one cannot be cut short.
+                depth = 1
+                i = start
+                end = -1
+                while True:
+                    close = buffer.find('}', i + 1)
+                    if close == -1:
+                        break
+                    opn = buffer.find('{', i + 1, close)
+                    if opn != -1:
+                        depth += 1
+                        i = opn
+                        continue
+                    depth -= 1
+                    i = close
+                    if depth == 0:
+                        end = close
+                        break
+
+                if end == -1:
+                    # Incomplete: keep it, from its opening brace, for the next chunk
+                    if start:
+                        buffer = buffer[start:]
+                    break
+
+                train_data = parse_train_fragment(buffer[start:end + 1], keep)
+                buffer = buffer[end + 1:]
+                raw_count += 1
+                _last_raw_count = raw_count
+                if train_data:
+                    trains.append(train_data)
+                    if len(trains) >= KEEP_MAX:
+                        return trains
+                if raw_count >= RAW_MAX:  # Prevent runaway parsing
+                    return trains
+
             # Keyed on chunks, not on retained rows: with a filter in place the
-            # retained count sits at 0 through most of the stream, which made
-            # the old `% 10` expression true on every single chunk.
+            # retained count sits at 0 through most of the stream.
             chunks += 1
             if chunks % 8 == 0:
                 gc.collect()
-            
+
             # Safety: prevent buffer from growing too large
             if len(buffer) > 1000:
                 print(f"⚠️ Buffer overflow protection: {len(buffer)} chars")
-                buffer = buffer[-500:]  # Keep only recent data
-        
+                buffer = buffer[-500:]
+
     except Exception as e:
         print(f"Direct chunk parsing error: {e}")
         gc.collect()
-    
+
     return trains
 
 def parse_train_fragment(train_json, keep=None):
-    """Parse a single complete train JSON object - ultra-lightweight"""
+    """One WMATA train object -> (LocationCode, Line, Destination, Min, Group).
+
+    A tuple, not a dict: a five-key dict carries a hash table several times the
+    size of a five-slot tuple, and up to KEEP_MAX of these are alive at once at
+    the tightest point of the refresh. Callers unpack it in that order.
+    """
     try:
         line = extract_field(train_json, '"Line":"')
         dest = extract_field(train_json, '"Destination":"')
         location = extract_field(train_json, '"LocationCode":"')
-        
-        # Malformed fragments are dropped before `keep` is consulted, which is
-        # exactly today's semantics — a predicate cannot resurrect one.
+
+        # Malformed fragments are dropped before `keep` is consulted — a
+        # predicate cannot resurrect one.
         if line and dest and location:
             if keep is not None and not keep(location, line, dest):
                 return None
             mins = extract_field(train_json, '"Min":"')
             group = extract_field(train_json, '"Group":"')
-            return {
-                'Line': line,
-                'Destination': dest, 
-                # WMATA emits unquoted "Min":null, for which extract_field
-                # returns None. Defaulting that to '0' invented a train
-                # arriving now; '---' maps to None in _parse_min, which is the
-                # honest answer. Likewise a missing Group used to default to
-                # southbound: '0' matches neither direction constant.
-                'Min': mins or '---',
-                'Group': group or '0',
-                'LocationCode': location
-            }
+            # WMATA emits unquoted "Min":null, for which extract_field returns
+            # None. Defaulting that to '0' invented a train arriving now; '---'
+            # maps to None in _parse_min, which is the honest answer. Likewise a
+            # missing Group used to default to southbound: '0' matches neither
+            # direction constant.
+            return (location, line, dest, mins or '---', group or '0')
     except:
         pass
     return None
@@ -551,16 +562,15 @@ def fetch_simple_dupont_trains(station_code: str) -> [dict]:
             print("❌ No train data received from simple API call")
             return []
         
-        # Filter to trains 7+ minutes away and take top N
+        # Filter to trains DISPLAY_FLOOR_MIN+ minutes away and take top N
         filtered_trains = []
-        for t in all_trains:
-            dest = t.get('Destination', '')
+        for _loc, line, dest, raw, _group in all_trains:
             if dest in NON_PASSENGER:
                 continue
 
-            mins = MetroApi._parse_min(t.get('Min'))
+            mins = MetroApi._parse_min(raw)
             if mins is not None and mins >= DISPLAY_FLOOR_MIN:
-                line_color = MetroApi._get_line_color(t.get('Line', ''))
+                line_color = MetroApi._get_line_color(line)
                 dest = normalize_destination(dest)
 
                 filtered_trains.append({
@@ -592,13 +602,15 @@ def fetch_simple_dupont_trains(station_code: str) -> [dict]:
 # and it is the invariant the equivalence test asserts.
 def keep_transfer_row(loc, line, dest):
     if loc == OSV_STATION:      # -> the upstream OR/SV branch (Clarendon)
-        return line in (LINE_OR, LINE_SV) and dest in EAST_DESTS
+        return line in (LINE_OR, LINE_SV) and is_east_dest(dest)
     if loc == BL_STATION:       # -> the upstream BL branch (Pentagon)
-        return line == LINE_BL and dest in EAST_DESTS
+        return line == LINE_BL and is_east_dest(dest)
     if loc == RD_GLEN_STATION:  # -> the Tenleytown branch; direction is
         return line == LINE_RD  #    accept_southbound's business, not ours.
     if loc == MAIN_STATION:     # -> Dupont's own board, both Groups;
         return line == LINE_RD  #    direction is decided downstream.
+    if loc == MC_EAST_STATION:  # -> Metro Center's own eastbound board
+        return line in (LINE_OR, LINE_SV, LINE_BL) and is_east_dest(dest)
     return False
 
 
@@ -607,7 +619,7 @@ class MetroApi:
     def fetch_train_predictions(station_code: str) -> [dict]:
         import gc
         import time
-        global _network, _request_count, _osv_preds, _bl_preds, _rd_glen_preds, _rd_south_measured, _rd_north_preds
+        global _network, _request_count, _osv_preds, _bl_preds, _rd_glen_preds, _rd_south_measured, _rd_north_preds, _mc_measured
         global _last_sync_time, _sync_interval
         
         # Sync with time server every ~3 hours
@@ -628,11 +640,13 @@ class MetroApi:
         bl_station, bl_offset = BL_PRED_SOURCE
         rd_glen_station, rd_glen_offset = RD_GLEN_PRED_SOURCE
 
-        # Four stations, same as before: two eastbound-connection sources, the
-        # Glenmont upstream source, and Dupont itself for northbound.
+        # Five stations in one request: two upstream eastbound sources,
+        # Metro Center's own eastbound board, the Glenmont upstream source, and
+        # Dupont itself. One request, not two: each HTTPS fetch is what costs
+        # memory here, while a longer body streams through the same small buffer.
         # No ?TrainGroup= — WMATA silently ignores it (verified: identical
         # responses with and without), so direction is decided here instead.
-        all_stations = f"{osv_station},{bl_station},{rd_glen_station},{main_station}"
+        all_stations = f"{osv_station},{bl_station},{MC_EAST_STATION},{rd_glen_station},{main_station}"
         api_path = all_stations
 
         # Safety valve: keep_transfer_row is written against the stations in
@@ -656,36 +670,40 @@ class MetroApi:
                 _rd_glen_preds.clear()
                 _rd_south_measured.clear()
                 _rd_north_preds.clear()
+                _mc_measured.clear()
 
                 # Process all trains from the single response
-                main_display_trains = []
                 front_t = None  # smallest *numeric* Tenleytown Min this refresh
-                for t in all_trains:
-                    loc = t['LocationCode']
-                    
+                for loc, line, dest, raw, group in all_trains:
+
                     # Upstream OR/SV predictions (Clarendon)
-                    if loc == osv_station and t['Line'] in (LINE_OR, LINE_SV) and t['Destination'] in EAST_DESTS:
-                        mins = MetroApi._parse_min(t['Min'])
+                    if loc == osv_station and line in (LINE_OR, LINE_SV) and is_east_dest(dest):
+                        mins = MetroApi._parse_min(raw)
                         if mins is None:
                             continue
-                        _osv_preds.append((str(t['Line']), mins + osv_offset))
+                        _osv_preds.append((line, mins + osv_offset))
 
                     # Upstream BL predictions (Pentagon)
-                    elif loc == bl_station and t['Line'] == LINE_BL and t['Destination'] in EAST_DESTS:
-                        mins = MetroApi._parse_min(t['Min'])
+                    elif loc == bl_station and line == LINE_BL and is_east_dest(dest):
+                        mins = MetroApi._parse_min(raw)
                         if mins is None:
                             continue
-                        _bl_preds.append((str(t['Line']), mins + bl_offset))
+                        _bl_preds.append((line, mins + bl_offset))
+
+                    # Metro Center's own eastbound board: measured, no offset.
+                    # Covers the connections already past Clarendon and Pentagon.
+                    elif loc == MC_EAST_STATION and line in (LINE_OR, LINE_SV, LINE_BL) and is_east_dest(dest):
+                        mins = MetroApi._parse_min(raw)
+                        if mins is None:
+                            continue
+                        _mc_measured.append((line, mins))
 
                     # Upstream southbound predictions (Tenleytown). Direction is
                     # Group, not a destination string: the ride is only as far as
                     # Metro Center, so Silver Spring and other turnbacks are just
-                    # as boardable as Glenmont. Logged raw for a few mornings so
-                    # the Group→direction mapping is confirmed from data.
-                    elif loc == rd_glen_station and t['Line'] == LINE_RD:
-                        dest = t['Destination']
-                        raw = t['Min']
-                        if not accept_southbound(t['Group'], dest):
+                    # as boardable as Glenmont.
+                    elif loc == rd_glen_station and line == LINE_RD:
+                        if not accept_southbound(group, dest):
                             continue
                         mins = upstream_min(raw)
                         if mins is None:
@@ -700,22 +718,22 @@ class MetroApi:
                     # Dupont's own southbound board. Same trains as the Tenleytown
                     # model once they are close enough for Dupont to see them, but
                     # measured rather than modelled — see _overlay_measured.
-                    elif loc == main_station and t['Line'] == LINE_RD and t['Group'] == SOUTHBOUND_GROUP:
-                        if not accept_southbound(t['Group'], t['Destination']):
+                    elif loc == main_station and line == LINE_RD and group == SOUTHBOUND_GROUP:
+                        if not accept_southbound(group, dest):
                             continue
-                        mins = MetroApi._parse_min(t['Min'])
+                        mins = MetroApi._parse_min(raw)
                         if mins is not None:
-                            _rd_south_measured.append(mins)
+                            _rd_south_measured.append((normalize_destination(dest), mins))
 
                     # Northbound, straight off Dupont's own board. No destination
                     # filter and no offset — these trains stop here. Group is the
                     # direction; anything you can actually board counts.
-                    elif loc == main_station and t['Line'] == LINE_RD and t['Group'] == NORTHBOUND_GROUP:
-                        if t['Destination'] in NON_PASSENGER:
+                    elif loc == main_station and line == LINE_RD and group == NORTHBOUND_GROUP:
+                        if dest in NON_PASSENGER:
                             continue
-                        mins = MetroApi._parse_min(t['Min'])
+                        mins = MetroApi._parse_min(raw)
                         if mins is not None and mins >= DISPLAY_FLOOR_MIN:
-                            _rd_north_preds.append((normalize_destination(t['Destination']), mins))
+                            _rd_north_preds.append((normalize_destination(dest), mins))
 
                 n_kept = len(all_trains)
                 del all_trains
@@ -723,46 +741,42 @@ class MetroApi:
 
                 # Sort Red Line caches by arrival time (earliest first)
                 _rd_glen_preds.sort(key=lambda p: p[1])
-                _rd_south_measured.sort()
+                _rd_south_measured.sort(key=lambda p: p[1])
                 _rd_north_preds.sort(key=lambda p: p[1])
 
                 print('cached osv', len(_osv_preds), 'bl', len(_bl_preds),
+                      'mc', len(_mc_measured),
                       'model', len(_rd_glen_preds), 'meas', len(_rd_south_measured),
                       'north', len(_rd_north_preds),
                       'kept', n_kept, 'raw', _last_raw_count)
 
-                record_observation(front_t, _rd_south_measured)
+                record_observation(front_t, [p[1] for p in _rd_south_measured])
 
-                # _overlay_measured works in plain minutes; pair the destination
-                # back on afterwards, in order — the overlay is one-for-one and
-                # both lists are ascending. Two southbound trains within the
-                # match window of each other could in principle swap labels;
-                # the minutes stay right, which is what the board is for.
-                south_mins = MetroApi._overlay_measured([p[1] for p in _rd_glen_preds], _rd_south_measured, DUPONT_MATCH_WINDOW)
+                south = MetroApi._overlay_measured(_rd_glen_preds, _rd_south_measured, DUPONT_MATCH_WINDOW)
 
-                # Rehydrate predictions into the main display list
-                for i, m in enumerate(south_mins):
-                    main_display_trains.append({'line_color': MetroApi._get_line_color(LINE_RD), 'destination': _rd_glen_preds[i][0], 'arrival': str(m), 'skip_mode': False, 'skip_reason': None, 'southbound': True})
-                for dest, m in _rd_north_preds:
-                    main_display_trains.append({'line_color': MetroApi._get_line_color(LINE_RD), 'destination': dest, 'arrival': str(m), 'skip_mode': False, 'skip_reason': None, 'southbound': False})
-
-                # Sort all trains by arrival time
-                main_display_trains.sort(key=MetroApi._safe_sort_key)
-
-                # Filter to trains 7+ minutes away — the whole list, not just the
-                # top N. The third row's SKIP decision needs a successor to
-                # compare against, so the cut to NUM_TRAINS happens afterwards.
+                # Cut to the display floor *before* building display dicts, so
+                # nothing below it ever costs one. The whole remaining list is
+                # kept, not just the top N: the third row's SKIP decision needs a
+                # successor to compare against, so that cut happens afterwards.
+                red = MetroApi._get_line_color(LINE_RD)
                 filtered_trains = []
-                for t in main_display_trains:
-                    if isinstance(t['arrival'], str) and t['arrival'].isdigit() and int(t['arrival']) >= DISPLAY_FLOOR_MIN:
-                        filtered_trains.append(t)
+                for dest, m in south:
+                    if m >= DISPLAY_FLOOR_MIN:
+                        filtered_trains.append({'line_color': red, 'destination': dest, 'arrival': str(m), 'skip_mode': False, 'skip_reason': None, 'southbound': True})
+                for dest, m in _rd_north_preds:
+                    filtered_trains.append({'line_color': red, 'destination': dest, 'arrival': str(m), 'skip_mode': False, 'skip_reason': None, 'southbound': False})
+                del south
+                filtered_trains.sort(key=MetroApi._safe_sort_key)
 
-                all_east_preds = _osv_preds + _bl_preds
-                all_east_preds.sort(key=lambda p: p[1]) # Sort by arrival time
+                modeled_east = _osv_preds + _bl_preds
+                modeled_east.sort(key=lambda p: p[1])
+                _mc_measured.sort(key=lambda p: p[1])
+                all_east_preds = MetroApi._merge_east(modeled_east, _mc_measured, EAST_MATCH_WINDOW)
+                del modeled_east
                 MetroApi._apply_transfer_logic(filtered_trains, all_east_preds)
 
                 display_trains = filtered_trains[:NUM_TRAINS]
-                del main_display_trains, filtered_trains
+                del filtered_trains
                 gc.collect()
                 MetroApi._last_display_data = display_trains
                 MetroApi._last_data_time = time.monotonic()
@@ -823,24 +837,68 @@ class MetroApi:
 
     @staticmethod
     def _overlay_measured(modeled, measured, window):
-        """Prefer Dupont's own figure where the same train appears in both sorted
-        lists. Trains >7 min out are still behind Tenleytown, so they show in both."""
+        """Merge the Tenleytown model with Dupont's own board.
+
+        Both are ascending (destination, minutes) lists. Where one train appears
+        in both, Dupont's measured figure and label win; it takes the measured
+        row nearest the modelled minute, so a train that has already left
+        Tenleytown cannot steal the match from the one now boarding there.
+
+        A measured train with no modelled partner is still a train, and is kept.
+        It is almost always one that has already left Tenleytown, so it can never
+        appear in the model again. Dropping it — which this used to do — took the
+        nearest southbound train off the board from ~8 minutes out, exactly when
+        it was still catchable.
+        """
         if not measured:
             return modeled
 
         out = []
         j = 0
-        for m in modeled:
-            while j < len(measured) and measured[j] < m - window:
-                j += 1
-            if j < len(measured) and measured[j] <= m + window:
+        n = len(measured)
+        for p in modeled:
+            m = p[1]
+            while j < n and measured[j][1] < m - window:
                 out.append(measured[j])
                 j += 1
+            best = -1
+            k = j
+            while k < n and measured[k][1] <= m + window:
+                if best < 0 or abs(measured[k][1] - m) < abs(measured[best][1] - m):
+                    best = k
+                k += 1
+            if best < 0:
+                out.append(p)
             else:
-                out.append(m)
-        out.sort()
+                # Anything passed over on the way to the nearest match is a
+                # separate train, not a duplicate of this one.
+                out.extend(measured[j:best])
+                out.append(measured[best])
+                j = best + 1
+        out.extend(measured[j:])
+        out.sort(key=lambda p: p[1])
         return out
 
+
+    @staticmethod
+    def _merge_east(modeled, measured, window):
+        """Upstream-modelled and Metro Center-measured eastbound arrivals, as
+        one ascending (line, minutes) list.
+
+        Matched line by line, so an Orange model is never mistaken for a Silver
+        train that happens to be a minute away from it. Measured wins where both
+        have a train; unmatched measured trains are the ones already past
+        Clarendon or Pentagon, which is the whole reason for reading C01.
+        """
+        if not measured:
+            return modeled
+        out = []
+        for line in (LINE_OR, LINE_SV, LINE_BL):
+            out += MetroApi._overlay_measured(
+                [p for p in modeled if p[0] == line],
+                [p for p in measured if p[0] == line], window)
+        out.sort(key=lambda p: p[1])
+        return out
 
     @staticmethod
     def _safe_sort_key(t):

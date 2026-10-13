@@ -168,29 +168,56 @@ def test_non_glenmont_rows_are_untouched():
 # _overlay_measured
 # --------------------------------------------------------------------------
 
+def _overlay(modeled, measured, window=3):
+    """_overlay_measured in plain minutes. Model rows are labelled 'm', measured
+    'd', so each result also says which source it came from."""
+    out = MetroApi._overlay_measured([('m', x) for x in modeled],
+                                     [('d', x) for x in measured], window)
+    return [(src, x) for src, x in out]
+
+
 def test_overlay_with_no_measured_data_returns_the_model():
-    assert MetroApi._overlay_measured([8, 14, 21], [], 3) == [8, 14, 21]
+    assert _overlay([8, 14, 21], []) == [('m', 8), ('m', 14), ('m', 21)]
 
 
 def test_overlay_full_overlap_prefers_measured():
-    assert MetroApi._overlay_measured([8, 14, 21], [7, 15, 20], 3) == [7, 15, 20]
+    assert _overlay([8, 14, 21], [7, 15, 20]) == [('d', 7), ('d', 15), ('d', 20)]
 
 
 def test_overlay_partial_overlap_keeps_unmatched_model_values():
     # 14 has no measured partner within 3 minutes; 8 and 21 do.
-    assert MetroApi._overlay_measured([8, 14, 21], [9, 22], 3) == [9, 14, 22]
+    assert _overlay([8, 14, 21], [9, 22]) == [('d', 9), ('m', 14), ('d', 22)]
 
 
-def test_overlay_can_pull_a_train_under_the_seven_minute_cut():
-    assert MetroApi._overlay_measured([8], [6], 3) == [6]
+def test_overlay_can_pull_a_train_under_the_display_floor():
+    assert _overlay([8], [5]) == [('d', 5)]
 
 
 def test_overlay_does_not_reuse_one_measurement_for_two_trains():
-    assert MetroApi._overlay_measured([8, 9], [8], 3) == [8, 9]
+    assert _overlay([8, 9], [8]) == [('d', 8), ('m', 9)]
 
 
-def test_overlay_ignores_measurements_outside_the_window():
-    assert MetroApi._overlay_measured([20], [3], 3) == [20]
+def test_overlay_keeps_a_measured_train_with_no_model_partner():
+    """A measurement outside every window is its own train, not noise."""
+    assert _overlay([20], [3]) == [('d', 3), ('m', 20)]
+
+
+def test_overlay_keeps_the_train_that_has_already_left_tenleytown():
+    """The bug: Tenleytown's front train is boarding (model 8); the one ahead of
+    it has left Tenleytown and Dupont shows it at 6. Greedy matching paired the
+    6 with the model's 8, so the boarding train lost its row and the board
+    showed one train where there were two."""
+    assert _overlay([8, 15], [6, 8, 15]) == [('d', 6), ('d', 8), ('d', 15)]
+
+
+def test_overlay_with_an_empty_model_is_dupont_alone():
+    assert _overlay([], [6, 12]) == [('d', 6), ('d', 12)]
+
+
+def test_overlay_takes_dupont_s_destination_label():
+    out = MetroApi._overlay_measured([('Glenmont', 8), ('Glenmont', 12)],
+                                     [('SilvrSpg', 8), ('Glenmont', 12)], 3)
+    assert out == [('SilvrSpg', 8), ('Glenmont', 12)]
 
 
 # --------------------------------------------------------------------------
@@ -416,9 +443,11 @@ def test_stale_data_drops_every_time_based_claim():
 # The parse loop, end to end
 # --------------------------------------------------------------------------
 
+from metro_api import keep_transfer_row
+
+
 def _row(loc, line, dest, mins, group):
-    return {'LocationCode': loc, 'Line': line, 'Destination': dest,
-            'Min': mins, 'Group': group}
+    return (loc, line, dest, mins, group)  # parse_train_fragment's row shape
 
 
 @pytest.fixture
@@ -458,6 +487,39 @@ def test_full_fetch_keeps_a_silver_spring_train_as_a_southbound_row(_fake_api):
     # The Silver Spring train transfers like any other southbound train.
     assert south[0]['skip_mode'] is False
     assert south[0]['line_color'] == MetroApi._get_line_color('OR')
+
+
+def test_full_fetch_shows_a_six_minute_train_that_has_left_tenleytown(_fake_api):
+    """Tenleytown's board no longer has this train; Dupont's does, at 6."""
+    _fake_api([
+        _row('A03', 'RD', 'Glenmont', '6', SOUTH),
+        _row('A07', 'RD', 'Glenmont', '4', SOUTH),        # → 12 at Dupont
+        _row('A03', 'RD', 'Glenmont', '12', SOUTH),
+        _row('K02', 'OR', 'New Carrollton', '2', '1'),    # → 14 at Metro Center
+    ])
+    out = MetroApi.fetch_train_predictions('A03')
+    assert [(t['destination'], t['arrival']) for t in out] == [('Glenmont', '6'), ('Glenmont', '12')]
+
+
+def test_full_fetch_floor_is_six_minutes(_fake_api):
+    _fake_api([
+        _row('A03', 'RD', 'Shady Grove', '5', NORTH),
+        _row('A03', 'RD', 'Shady Grove', '6', NORTH),
+    ])
+    out = MetroApi.fetch_train_predictions('A03')
+    assert [t['arrival'] for t in out] == ['6']
+
+
+@pytest.mark.parametrize('dest', ['Largo', 'Downtown Largo', 'Dwntn Largo',
+                                  'New Carrollton', 'N Carrollton', 'NewCrlton'])
+def test_eastbound_destinations_survive_renames_and_abbreviation(dest):
+    assert metro_api.is_east_dest(dest) is True
+    assert keep_transfer_row('C07', 'BL', dest) is True
+
+
+@pytest.mark.parametrize('dest', ['Franconia', 'Vienna', 'Ashburn', 'Huntington'])
+def test_westbound_destinations_are_not_connections(dest):
+    assert metro_api.is_east_dest(dest) is False
 
 
 def test_full_fetch_drops_everything_if_the_group_mapping_were_inverted(_fake_api):
@@ -538,7 +600,8 @@ class _FakeResponse:
 
 ALL_CHUNK_SIZES = [1, 2, 3, 7, 16, 64, 256, 4096]
 
-# A realistic four-station body: two eastbound sources, Tenleytown, Dupont.
+# A realistic five-station body: two upstream eastbound sources, Metro Center,
+# Tenleytown, Dupont.
 FOUR_STATION_ROWS = [
     _train_json('K02', 'OR', 'New Carrollton', '2', '1', loc_name='Clarendon'),
     _train_json('K02', 'SV', 'Largo', '6', '1', loc_name='Clarendon'),
@@ -547,6 +610,10 @@ FOUR_STATION_ROWS = [
     _train_json('C07', 'BL', 'Largo', '5', '1', loc_name='Pentagon'),
     _train_json('C07', 'YL', 'Greenbelt', '3', '1', loc_name='Pentagon'),
     _train_json('C07', 'BL', 'Franconia', '8', '2', loc_name='Pentagon'),
+    _train_json('C01', 'OR', 'New Carrollton', '3', '1', loc_name='Metro Center'),
+    _train_json('C01', 'BL', 'Downtown Largo', 'BRD', '1', loc_name='Metro Center'),
+    _train_json('C01', 'SV', 'Ashburn', '2', '2', loc_name='Metro Center'),
+    _train_json('C01', 'OR', 'No Passenger', '5', '1', loc_name='Metro Center'),
     _train_json('A07', 'RD', 'Glenmont', '4', '1', loc_name='Tenleytown'),
     _train_json('A07', 'RD', 'Silver Spring', '9', '1', loc_name='Tenleytown'),
     _train_json('A07', 'RD', 'Shady Grove', '3', '2', loc_name='Tenleytown'),
@@ -565,12 +632,14 @@ def _legacy_relevant(row):
     Route identity only, matching the chain's station/line/destination
     conditions; time and direction are the chain's business, not the filter's.
     """
-    loc, line, dest = row['LocationCode'], row['Line'], row['Destination']
-    east = ('New Carrollton', 'N Carrollton', 'NewCrlton', 'Largo')
+    loc, line, dest = row[0], row[1], row[2]
+    east = ('New Carrollton', 'N Carrollton', 'NewCrlton', 'Largo', 'Downtown Largo')
     if loc == 'K02':
         return line in ('OR', 'SV') and dest in east
     if loc == 'C07':
         return line == 'BL' and dest in east
+    if loc == 'C01':
+        return line in ('OR', 'SV', 'BL') and dest in east
     if loc == 'A07':
         return line == 'RD'
     if loc == 'A03':
@@ -598,10 +667,8 @@ def test_parse_single_station_body():
                         _train_json('A03', 'RD', 'Shady Grove', 'BRD', '2')])
     trains = direct_chunk_parse_trains(_FakeResponse(body))
     assert trains == [
-        {'Line': 'RD', 'Destination': 'Glenmont', 'Min': '5', 'Group': '1',
-         'LocationCode': 'A03'},
-        {'Line': 'RD', 'Destination': 'Shady Grove', 'Min': 'BRD', 'Group': '2',
-         'LocationCode': 'A03'},
+        ('A03', 'RD', 'Glenmont', '5', '1'),
+        ('A03', 'RD', 'Shady Grove', 'BRD', '2'),
     ]
 
 
@@ -624,7 +691,7 @@ def test_split_inside_the_trains_marker():
         def iter_content(self, _n=256):
             return iter(chunks)
 
-    assert direct_chunk_parse_trains(_R())[0]['Destination'] == 'Glenmont'
+    assert direct_chunk_parse_trains(_R())[0][2] == 'Glenmont'
 
 
 def test_split_inside_a_field_value():
@@ -636,14 +703,14 @@ def test_split_inside_a_field_value():
         def iter_content(self, _n=256):
             return iter(chunks)
 
-    assert direct_chunk_parse_trains(_R())[0]['Destination'] == 'Silver Spring'
+    assert direct_chunk_parse_trains(_R())[0][2] == 'Silver Spring'
 
 
 @pytest.mark.parametrize('raw', ['BRD', 'ARR', '---', '4'])
 def test_min_survives_the_parser_verbatim(raw):
     """The parser must not interpret Min — that is _parse_min's job, later."""
     body = _wmata_body([_train_json('A03', 'RD', 'Glenmont', raw, '1')])
-    assert direct_chunk_parse_trains(_FakeResponse(body))[0]['Min'] == raw
+    assert direct_chunk_parse_trains(_FakeResponse(body))[0][3] == raw
 
 
 def test_empty_trains_array():
@@ -659,7 +726,7 @@ def test_stream_ending_mid_object_drops_the_partial_row():
                         _train_json('A03', 'RD', 'Shady Grove', '9', '2')])
     truncated = body[:len(body) - 30]
     trains = direct_chunk_parse_trains(_FakeResponse(truncated))
-    assert [t['Destination'] for t in trains] == ['Glenmont']
+    assert [t[2] for t in trains] == ['Glenmont']
 
 
 def test_undecodable_bytes_do_not_kill_the_parse():
@@ -667,7 +734,7 @@ def test_undecodable_bytes_do_not_kill_the_parse():
     raw = body.encode('utf-8').replace(b'Glenmont', b'Glen\xffont')
     trains = direct_chunk_parse_trains(_FakeResponse(raw, 4096, encode=False))
     assert len(trains) == 1
-    assert trains[0]['LocationCode'] == 'A03'
+    assert trains[0][0] == 'A03'
 
 
 def test_raw_count_cap_bounds_the_loop():
@@ -740,6 +807,10 @@ def test_the_filter_materially_shrinks_retention():
     ('A03', 'RD', 'Glenmont', True),
     ('A03', 'RD', 'Shady Grove', True),      # both Groups
     ('A03', 'BL', 'Largo', False),
+    ('C01', 'OR', 'New Carrollton', True),
+    ('C01', 'BL', 'Downtown Largo', True),
+    ('C01', 'SV', 'Ashburn', False),         # westbound
+    ('C01', 'RD', 'Glenmont', False),        # Red is A01, not C01
     ('B35', 'RD', 'Glenmont', False),        # a station we never asked for
 ])
 def test_keep_transfer_row_accept_reject_table(loc, line, dest, kept):
@@ -806,8 +877,9 @@ def test_a_station_code_disagreeing_with_config_disables_the_filter(_wire_api,
     out = MetroApi.fetch_train_predictions('B35')
     # With the filter wrongly enabled every B35 row would be rejected during the
     # parse and the board would come up blank. Falling back to keep=None
-    # degrades to today's behaviour instead.
-    assert [t['destination'] for t in out] == ['Shady Gro']
+    # degrades to today's behaviour instead. Both directions show: the main
+    # station's own southbound row is a measured train in its own right.
+    assert [t['destination'] for t in out] == ['Shady Gro', 'Glenmont']
     assert 'kept 2 raw 2' in capsys.readouterr().out
 
 
@@ -818,7 +890,7 @@ def test_a07_keeps_every_direction_through_the_parse(_wire_api):
             _train_json('A07', 'RD', 'Glenmont', '4', '1')]
     body = _wmata_body(rows)
     kept = direct_chunk_parse_trains(_FakeResponse(body), keep_transfer_row)
-    assert [r['Destination'] for r in kept] == ['Shady Grove', 'Glenmont']
+    assert [r[2] for r in kept] == ['Shady Grove', 'Glenmont']
 
     _wire_api(body)
     out = MetroApi.fetch_train_predictions('A03')
@@ -842,16 +914,16 @@ NO_GROUP_ROW = ('{"Destination":"Glenmont","Line":"RD","LocationCode":"A03",'
 
 def test_a_null_min_carries_no_time_instead_of_arriving_now():
     parsed = parse_train_fragment(NULL_MIN_ROW)
-    assert parsed['Min'] == '---'
-    assert MetroApi._parse_min(parsed['Min']) is None
+    assert parsed[3] == '---'
+    assert MetroApi._parse_min(parsed[3]) is None
 
 
 def test_a_missing_group_matches_neither_direction():
     parsed = parse_train_fragment(NO_GROUP_ROW)
-    assert parsed['Group'] == '0'
-    assert parsed['Group'] not in (metro_api.NORTHBOUND_GROUP,
-                                   metro_api.SOUTHBOUND_GROUP)
-    assert accept_southbound(parsed['Group'], 'Glenmont') is False
+    assert parsed[4] == '0'
+    assert parsed[4] not in (metro_api.NORTHBOUND_GROUP,
+                             metro_api.SOUTHBOUND_GROUP)
+    assert accept_southbound(parsed[4], 'Glenmont') is False
 
 
 def test_a_row_with_no_group_does_not_silently_become_southbound(_wire_api):
@@ -864,3 +936,72 @@ def test_a_row_with_no_group_does_not_silently_become_southbound(_wire_api):
     out = MetroApi.fetch_train_predictions('A03')
     # Tenleytown 4 + 8 = 12, modelled. The Group-less 9 is not a measurement.
     assert [(t['destination'], t['arrival']) for t in out] == [('Glenmont', '12')]
+
+
+# --------------------------------------------------------------------------
+# Metro Center's own eastbound board
+# --------------------------------------------------------------------------
+
+def test_merge_east_without_metro_center_is_the_model():
+    model = [('OR', 14), ('BL', 18)]
+    assert MetroApi._merge_east(model, [], 3) == model
+
+
+def test_merge_east_adds_connections_already_past_the_upstream_stations():
+    """The blind spot: an Orange at Metro Center in 10 has left Clarendon, so
+    the model cannot have it. Metro Center's own board can."""
+    out = MetroApi._merge_east([('OR', 18)], [('OR', 10), ('OR', 17)], 3)
+    assert out == [('OR', 10), ('OR', 17)]
+
+
+def test_merge_east_matches_within_a_line_only():
+    """A Silver measured at 13 is not the Orange modelled at 14."""
+    out = MetroApi._merge_east([('OR', 14)], [('SV', 13)], 3)
+    assert out == [('SV', 13), ('OR', 14)]
+
+
+def test_full_fetch_front_train_catches_the_connection_it_used_to_miss(_fake_api):
+    """Southbound at 6 → Metro Center at 10. The real first connection is an
+    Orange at 11, already past Clarendon. Without C01 the train would chase the
+    Silver at 19, find the next southbound catches it too, and wrongly blink
+    SKIP."""
+    _fake_api([
+        _row('A03', 'RD', 'Glenmont', '6', SOUTH),
+        _row('A03', 'RD', 'Glenmont', '12', SOUTH),
+        _row('C01', 'OR', 'New Carrollton', '11', '1'),
+        _row('K02', 'SV', 'Largo', '7', '1'),             # → 19 at Metro Center
+    ])
+    out = MetroApi.fetch_train_predictions('A03')
+    assert out[0]['arrival'] == '6'
+    assert out[0]['skip_mode'] is False
+    assert out[0]['line_color'] == MetroApi._get_line_color('OR')
+
+
+def test_full_fetch_requests_metro_center_in_the_same_call(monkeypatch, _fake_api):
+    _fake_api([_row('A03', 'RD', 'Glenmont', '9', SOUTH)])
+    paths = []
+    monkeypatch.setattr(metro_api, 'optimized_fetch',
+                        lambda path, keep=None: paths.append(path) or
+                        [_row('A03', 'RD', 'Glenmont', '9', SOUTH)])
+    MetroApi.fetch_train_predictions('A03')
+    assert len(paths) == 1
+    assert paths[0].split(',') == ['K02', 'C07', 'C01', 'A07', 'A03']
+
+
+# --------------------------------------------------------------------------
+# Memory shape
+# --------------------------------------------------------------------------
+
+def test_parsed_rows_are_tuples_not_dicts():
+    """Up to KEEP_MAX rows are alive at the tightest point of a refresh; a
+    tuple is a fraction of a five-key dict."""
+    row = parse_train_fragment(_train_json('A03', 'RD', 'Glenmont', '5', '1'))
+    assert type(row) is tuple and len(row) == 5
+
+
+def test_parser_handles_a_nested_object_without_cutting_it_short():
+    body = ('{"Trains":[{"Line":"RD","Destination":"Glenmont","Extra":{"a":"b"},'
+            '"LocationCode":"A03","Min":"5","Group":"1"}]}')
+    for size in ALL_CHUNK_SIZES:
+        trains = direct_chunk_parse_trains(_FakeResponse(body, size))
+        assert trains == [('A03', 'RD', 'Glenmont', '5', '1')], size

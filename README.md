@@ -174,18 +174,23 @@ Residual risks, honestly:
 ## Metro logic
 
 Outside the weekday 06:45–08:30 window, the board runs "simple mode": one
-request to Dupont, both directions, next three trains at least 7 minutes out
-(the walk to the station).
+request to Dupont, both directions, next three trains at least 6 minutes out
+(the walk to the station, `display_floor_min` in `config.py`).
 
-Inside the window it makes one combined request for four stations and merges:
+Inside the window it makes one combined request for five stations and merges:
 
-- **Southbound (Glenmont)** from Tenleytown (`A07`) plus a 7-minute ride offset,
-  so predictions extend further out than Dupont's own board reaches.
+- **Southbound (Glenmont)** from Tenleytown (`A07`) plus an 8-minute ride offset,
+  so predictions extend further out than Dupont's own board reaches. Where
+  Dupont's own board has the same train, its figure wins; trains Dupont sees
+  that have already left Tenleytown are kept as-is.
 - **Northbound** straight off Dupont's own board, selected on WMATA's `Group`
   field (`Group 2` is northbound at A03) with no destination filter.
-- **Onward eastbound connections** at Metro Center from Clarendon (`K02`) and
-  Pentagon (`C07`), used to decide whether each Glenmont train is worth taking
-  or should blink "skip".
+- **Onward eastbound connections** at Metro Center, used to decide whether
+  each Glenmont train is worth taking or should blink "skip". Metro Center's
+  own lower-level board (`C01`) covers the near term; Clarendon (`K02`)
+  and Pentagon (`C07`) plus a ride offset reach further out. Upstream alone
+  misses every connection already past them — usually the one the front
+  southbound train catches. Matched line by line, measured wins.
 
 Selecting northbound on `Group` rather than on a destination string is
 deliberate. The previous version sourced northbound from NoMa (`B35`) filtered
