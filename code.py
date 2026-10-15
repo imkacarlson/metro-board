@@ -35,7 +35,12 @@ NO_SERVICE_END_HOUR = config['no_service_end_hour']
 # Same pinned owner/repo/branch as ota.py. This file only ever *reads* the
 # version; ota.py is the only thing that writes to the filesystem.
 MANIFEST_URL = 'https://raw.githubusercontent.com/imkacarlson/metro-board/deploy/manifest.json'
-UPDATE_CHECK_INTERVAL = 24 * 60 * 60  # seconds
+# The daily check is a reboot (see the main loop), so it only happens in the
+# 2-5 AM no-service window. It used to fire 24 h after the last check, which
+# after the transfer-window deferral meant 08:31 every weekday. The window does
+# the scheduling; the gap, just longer than the 3-hour window, only stops the
+# boot that the reboot causes from rebooting again the same night.
+UPDATE_CHECK_MIN_GAP = 4 * 60 * 60  # seconds
 
 _last_update_check = 0
 _marked_healthy = False
@@ -79,12 +84,8 @@ def check_for_update(force=False):
 		# per boot right after the first refresh — the tightest-memory moment of
 		# the cycle, during the only window that fetches four stations at once.
 		# /version.txt already matches on nearly every boot, so it fragments for
-		# nothing. Costs an overnight update installing after 08:30, not 06:45.
+		# nothing. The main loop picks it up in the next no-service window.
 		print('OTA: transfer window — deferring the update check')
-		# After the assignment above, not instead of it: leaving _last_update_check
-		# alone would make the main loop's >= UPDATE_CHECK_INTERVAL branch spin
-		# every 10 ms. Same backoff idiom as update_system_time.
-		_last_update_check = time.monotonic() - UPDATE_CHECK_INTERVAL + (15 * 60)
 		return
 
 	if supervisor.runtime.usb_connected:
@@ -185,6 +186,10 @@ def is_no_service_hours():
 	return NO_SERVICE_START_HOUR <= hour < NO_SERVICE_END_HOUR
 
 def refresh_trains() -> [dict]:
+	# Before the no-service check, not after: 2-5 AM is where the daily sync is
+	# meant to happen, and refresh is the only thing that runs then.
+	metro_api.sync_time_if_due()
+
 	# Skip API calls during no-service hours
 	if is_no_service_hours():
 		print('🌙 No service hours (2-5 AM) - skipping API call')
@@ -297,19 +302,20 @@ while True:
 			train_board.update_blink()
 			last_blink_update = current_time
 
-		# On demand via the UP button, otherwise once a day. The daily path
+		# On demand via the UP button, otherwise once a night. The nightly path
 		# reboots instead of checking in place: by now the first fetch has taken
 		# its ~54 KB and a manifest fetch here is what started the reboot loop.
 		# A reboot lands in the high-memory regime where the check belongs, and
-		# never during the morning window.
+		# only in the no-service window, when nobody is reading the board. The
+		# boot it causes also gets the nightly clock sync.
 		button_down = up_button is not None and not up_button.value
 		if button_down and not button_was_down:
 			print('UP button pressed — checking for an update')
 			check_for_update(force=True)
 		elif (_marked_healthy
-				and current_time - _last_update_check >= UPDATE_CHECK_INTERVAL
-				and not metro_api.is_transfer_intelligence_time()):
-			print('Daily update check — rebooting into it')
+				and current_time - _last_update_check >= UPDATE_CHECK_MIN_GAP
+				and metro_api.is_quiet_hours()):
+			bootlog.append('code: nightly update check — rebooting into it')
 			supervisor.reload()
 		button_was_down = button_down
 

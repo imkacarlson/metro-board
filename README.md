@@ -52,8 +52,10 @@ workflow from re-triggering itself.
 
 The board fetches
 `https://raw.githubusercontent.com/imkacarlson/metro-board/deploy/manifest.json`
-after its first successful display refresh, once every 24 hours, and on demand
-whenever the **UP button** is pressed. `raw.githubusercontent.com` caches for
+on every boot (except during the weekday transfer window), once a night by
+rebooting itself in the 2-5 AM no-service window, and on demand whenever the
+**UP button** is pressed. The clock is synced the same way: on a cold boot, then
+once a night in that window — never during the morning commute. `raw.githubusercontent.com` caches for
 about five minutes, which is irrelevant at a daily poll and barely noticeable
 after a button press.
 

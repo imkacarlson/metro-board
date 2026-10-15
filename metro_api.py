@@ -22,6 +22,8 @@ TRANSFER_START_HOUR = config['transfer_start_hour']
 TRANSFER_START_MINUTE = config['transfer_start_minute']
 TRANSFER_END_HOUR = config['transfer_end_hour']
 TRANSFER_END_MINUTE = config['transfer_end_minute']
+NO_SERVICE_START_HOUR = config['no_service_start_hour']
+NO_SERVICE_END_HOUR = config['no_service_end_hour']
 
 MAIN_STATION = config['metro_station_code']
 OSV_STATION = OSV_PRED_SOURCE[0]
@@ -71,9 +73,21 @@ STALE_AFTER = 90
 _network = None
 _request_count = 0
 
-# Time syncing globals
-_last_sync_time = 0
-_sync_interval = 3 * 60 * 60  # 3 hours in seconds
+# Clock sync. Once a day, in the no-service window, and never mid-commute.
+#
+# This used to run every 3 hours from inside the train fetch. The 2-5 AM
+# no-service gap skipped the ~02:30 sync, so the first fetch at 05:00 did it,
+# which put the next one at exactly 08:00 — in the four-station transfer window,
+# where a fetch to a second host is what tips free RAM under MEM_FLOOR. Every
+# weekday 08:00 reload in /board.log from 2026-09-23 on is that.
+#
+# Nothing on screen reads the wall clock (arrivals are WMATA's own minutes and
+# staleness uses monotonic); it only picks the transfer and no-service windows.
+# Measured drift is 0.5-2 min/day, so daily is plenty. 20 h rather than 24 so a
+# slightly slow clock cannot slide past the 3-hour window and skip a night.
+SYNC_INTERVAL = 20 * 60 * 60
+SYNC_RETRY = 30 * 60
+_next_sync = None  # monotonic deadline; None means at the first chance
 
 def _init_network():
     """Initialize network with memory optimizations"""
@@ -98,30 +112,58 @@ def _init_network():
         gc.collect()
         print("Optimized networking initialized")
 
+def clock_is_set():
+    """False until the RTC has been set from the network at least once.
+
+    A soft reload keeps the RTC, so this stays True across supervisor.reload();
+    only a cold power-on starts back at 2000.
+    """
+    import time
+    return time.localtime()[0] >= 2024
+
+
+def is_quiet_hours():
+    """The no-service window (2-5 AM), and only when the clock can say so."""
+    import time
+    if not clock_is_set():
+        return False
+    return NO_SERVICE_START_HOUR <= time.localtime()[3] < NO_SERVICE_END_HOUR
+
+
+def sync_time_if_due():
+    """Set the clock if it has never been set, else at most daily in quiet hours.
+
+    An unset clock is the one case that syncs outside the window: until it is
+    set, the transfer and no-service windows are both wrong. That only happens
+    on a cold power-on, when memory is at its most plentiful anyway.
+    """
+    import time
+    if clock_is_set() and not is_quiet_hours():
+        return
+    if _next_sync is not None and time.monotonic() < _next_sync:
+        return
+    update_system_time()
+
+
 def update_system_time():
-    """Update system clock date/time from worldtimeapi.org. Sets RTC() time and
+    """Update system clock date/time from the network. Sets RTC() time and
        returns current local time struct and success status.
     """
     import time
-    global _network, _last_sync_time
+    import bootlog
+    global _network, _next_sync
     try:
         _init_network()
-        print("⏰ Syncing time with worldtimeapi.org...")
-        
-        # Get time from worldtimeapi.org (free, no account needed)
+        print("⏰ Syncing time...")
         local_time_string = _network.get_local_time()
-        elements = local_time_string.split(" ")
-        
-        # Update our last sync time
-        _last_sync_time = time.time()
-        
-        print(f"⏰ Time synced successfully: {local_time_string}")
+        _next_sync = time.monotonic() + SYNC_INTERVAL
+        bootlog.append('time: synced %s' % local_time_string)
         return RTC().datetime, True
-        
+
     except Exception as e:
-        print(f"⏰ Time sync failed: {e}")
-        # Push sync time ahead to retry in 30 minutes (don't overwhelm server)
-        _last_sync_time = time.time() - _sync_interval + (30 * 60)
+        # Retry in 30 minutes (don't overwhelm server)
+        _next_sync = time.monotonic() + SYNC_RETRY
+        bootlog.append('time: sync failed: %s' % e)
         return time.localtime(), False
 
 def optimized_fetch(api_path, keep=None):
@@ -544,14 +586,7 @@ def keep_simple_row(loc, line, dest):
 def fetch_simple_dupont_trains(station_code: str) -> [dict]:
     """Memory-efficient single-station fetch for non-transfer hours"""
     import gc
-    import time
-    global _last_sync_time, _sync_interval
-    
-    # Sync with time server every ~3 hours
-    current_time = time.time()
-    if current_time - _last_sync_time > _sync_interval:
-        update_system_time()
-    
+
     # No ?TrainGroup= — WMATA ignores it. Simple mode deliberately shows both
     # directions merged, which is the long-standing off-peak behaviour.
     api_path = station_code
@@ -620,13 +655,9 @@ class MetroApi:
         import gc
         import time
         global _network, _request_count, _osv_preds, _bl_preds, _rd_glen_preds, _rd_south_measured, _rd_north_preds, _mc_measured
-        global _last_sync_time, _sync_interval
-        
-        # Sync with time server every ~3 hours
-        current_time = time.time()
-        if current_time - _last_sync_time > _sync_interval:
-            update_system_time()
-        
+
+        # The clock is synced by code.py via sync_time_if_due(), never from here.
+
         # Check if we should use transfer intelligence or simple mode
         if not is_transfer_intelligence_time():
             return fetch_simple_dupont_trains(station_code)
