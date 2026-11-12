@@ -282,6 +282,7 @@ except Exception as e:
 last_refresh = 0
 last_blink_update = 0
 button_was_down = False
+screen_off = False
 BLINK_UPDATE_INTERVAL = 0.05  # Update blink every 50ms for smooth animation
 
 while True:
@@ -292,6 +293,16 @@ while True:
 		if current_time - last_refresh >= REFRESH_INTERVAL:
 			train_board.refresh()
 			last_refresh = current_time
+
+			# Blank the panel in the 2-5 AM no-service window to spare the LEDs.
+			# Brightness 0 pauses the rgbmatrix scan entirely: nothing is lit and
+			# nothing is allocated. Checked once per refresh, written only on a
+			# change. is_quiet_hours() is False until the clock is set, so a cold
+			# boot always shows the board.
+			quiet = metro_api.is_quiet_hours()
+			if quiet != screen_off:
+				train_board.display.brightness = 0 if quiet else 1
+				screen_off = quiet
 
 			if not _marked_healthy:
 				bootlog.append('code: first refresh ok, free=%d' % gc.mem_free())
